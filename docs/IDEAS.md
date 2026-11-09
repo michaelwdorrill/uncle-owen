@@ -1989,6 +1989,25 @@ above calls the better outcome: nothing currently tells the invitee the
 event is already underway. Worth a small follow-up pass if that silence
 turns out to matter in practice.
 
+### 109b. Launch night: "Couldn't load your server list" after agreeing to the policy (fixed in 1.0.1)
+
+Michael's first production visit on 1.0 (9 Nov 2026, 23:15 UTC). `GuildProvider`
+fetched `/guilds` as soon as someone was signed in, which included the moment
+the version-6 agreement screen was up. `/guilds` is policy-gated, so it
+answered 403, the error stuck, and agreeing didn't refetch: every returning
+user's first sight of 1.0 was a red banner until they pressed Try again. The
+fetch now waits on `policyAccepted()` (`frontend/src/lib/policyGate.ts`).
+Reproduced headless with the launch's exact state (agreed to 2, version 6 in
+force, `/guilds` refusing until agreement): before the fix, one `/guilds`
+call at version 2 and the banner; after, the first call is at 6 and there's
+no banner.
+
+Why the walkthrough missed it: on the sandbox the agreement screen is
+followed by the 1.0 pop-up, which covers the banner. Any other app-level
+fetch of gated data needs the same treatment, so it belongs in IDEAS 108's
+review sweep.
+
+
 ## Parked until after 1.0
 
 Deliberately deferred past 1.0, per the rule in "How this file is kept" above.
