@@ -173,12 +173,8 @@ describe('a stranded acceptance is never replayed over a later decision (P16-01)
 // P16-02
 // ---------------------------------------------------------------------------
 
-// The completion stamp used to live inside the same try as the event mutation,
-// so failing to RECORD an application was handled as failing TO apply: the
-// compensating release ran and the request went back to pending over an event
-// that had already moved.
-describe('a failed completion record does not undo the change (P16-02)', () => {
-  it('leaves the request accepted when only the stamp fails', async () => {
+describe('accepting a change request is atomic (P16-02)', () => {
+  it('rolls back the schedule change when the acceptance stamp fails', async () => {
     const { db, env } = setup('paid');
     await seedGuild(db, 'guild-1');
     for (const id of ['organizer', 'asker']) {
@@ -201,43 +197,18 @@ describe('a failed completion record does not undo the change (P16-02)', () => {
     const event = await db.prepare(`SELECT * FROM events WHERE id = 'ev-1'`).first<EventRow>();
     const request = await db.prepare(`SELECT * FROM event_change_requests WHERE id = 'cr-1'`).first();
 
-    // Only the completion stamp fails -- the mutation before it commits.
-    const failing = new Proxy(env.DB, {
-      get(target, prop, receiver) {
-        if (prop === 'prepare') {
-          return (sql: string) => {
-            const stmt = Reflect.get(target, prop, receiver).call(target, sql);
-            if (sql.includes('SET applied_at = ?')) {
-              return { bind: () => ({ run: async () => { throw new Error('injected stamp failure'); } }) };
-            }
-            return stmt;
-          };
-        }
-        return Reflect.get(target, prop, receiver);
-      },
-    });
-
-    // Through the exported entry point rather than the internal helper: the
-    // P14-09 lesson is that a test which reaches past the real caller can pass
-    // for reasons the real caller would not reproduce.
-    // Swallowed so the unfixed symptom arrives as an ASSERTION rather than a
-    // raw throw: on the old tree the catch released the claim and then
-    // rethrew, and "test errored" says much less than "status was pending".
-    await acceptChangeRequest({ ...env, DB: failing } as Env, event as never, request as never, 'organizer').catch(
-      () => undefined,
-    );
+    db.raw.exec(`CREATE TRIGGER refuse_stamp BEFORE UPDATE OF applied_at ON event_change_requests
+      BEGIN SELECT RAISE(ABORT, 'injected stamp failure'); END`);
+    await expect(acceptChangeRequest(env, event!, request as never, 'organizer')).rejects.toThrow('injected stamp failure');
 
     const row = await db
       .prepare(`SELECT status, applied_at FROM event_change_requests WHERE id = 'cr-1'`)
       .first<{ status: string; applied_at: number | null }>();
     const after = await db.prepare(`SELECT start_at FROM events WHERE id = 'ev-1'`).first<{ start_at: number }>();
 
-    expect(after!.start_at, 'the change did not apply, so this test is not about what it claims').toBe(proposedStart);
-    expect(
-      row!.status,
-      'a change that had already applied was released back to pending, where a stale revision declines it',
-    ).toBe('accepted');
-    expect(row!.applied_at, 'the stamp is expected to be missing -- that is the contained cost').toBeNull();
+    expect(after!.start_at).toBe(start);
+    expect(row!.status).toBe('pending');
+    expect(row!.applied_at).toBeNull();
   });
 });
 

@@ -1,8 +1,8 @@
 import type { Env } from '../env';
-import { writeOccurrenceMove, type EventRow } from './events';
+import { occurrenceMoveStatement, type EventRow } from './events';
 import { requireActiveGuildMember } from './db';
-import { chunkIds, placeholders, queryInChunks } from './d1';
-import { addInvitesToEvent, updateEvent } from './eventWrites';
+import { chunkIds, placeholders, queryInChunks, type SqlPredicate } from './d1';
+import { buildEventUpdate, requestedInviteStatements } from './eventWrites';
 import { newId } from './ids';
 import {
   assertIsoDate,
@@ -350,168 +350,57 @@ async function applyAndAccept(
   request: ChangeRequestRow,
   decidedBy: string | null,
 ): Promise<void> {
-  // Pass-12 review (P12-18). The decision is claimed BEFORE the event is
-  // touched, not recorded after it.
-  //
-  // acceptChangeRequest's `request.status !== 'pending'` check reads a row the
-  // route loaded earlier, so it is a check against a snapshot. A decline
-  // landing in between passed it anyway: the accept went on to move the event,
-  // and only then ran its `WHERE status = 'pending'` update, which matched
-  // nothing. The stored request read 'declined', complete with the organizer's
-  // decline note, while the schedule had already moved -- and nothing in the
-  // app showed the two disagreeing.
-  //
-  // Claiming first makes 'pending' the thing being competed for, so exactly
-  // one of accept and decline can win it, and the winner is the only one that
-  // gets to act.
-  const claim = await env.DB.prepare(
-    `UPDATE event_change_requests SET status = 'accepted', decided_at = ?, decided_by = ?
-     WHERE id = ? AND status = 'pending'`,
-  )
-    .bind(Date.now(), decidedBy, request.id)
-    .run();
-  if (claim.meta.changes === 0) throw new ConflictError('This request has already been decided');
-
-  try {
-    await applyChangeRequest(env, event, request);
-  } catch (err) {
-    // The claim is released rather than left standing over a change that did
-    // not happen. Without this a stale revision -- which updateEvent below
-    // throws for by design -- would leave a request reading 'accepted' beside
-    // an event that never moved, which is the same class of disagreement this
-    // finding is about, just the other way round.
-    await env.DB.prepare(
-      `UPDATE event_change_requests SET status = 'pending', decided_at = NULL, decided_by = NULL
-       WHERE id = ? AND status = 'accepted'`,
-    )
-      .bind(request.id)
-      .run();
-    throw err;
-  }
-
-  // Pass-16 review (P16-02). OUTSIDE the try, and that placement is the whole
-  // finding. Pass 15 put this write inside it, so a failure to RECORD the
-  // application was handled as a failure OF the application: the compensating
-  // release ran, the request went back to pending over an event that had
-  // already moved, and the next deadline pass declined it on a stale revision
-  // while the schedule kept the new time. Record and effect disagreed, and the
-  // decline was announceable.
-  //
-  // Its own failure is contained instead. What that costs is a row that
-  // applied and does not say so, which the notice gate reads as "not applied
-  // yet" and stays quiet about -- a missing notification rather than a false
-  // one, and no replay. IDEAS item 70 carries what closing it properly needs.
-  try {
-    await env.DB.prepare(`UPDATE event_change_requests SET applied_at = ? WHERE id = ?`)
-      .bind(Date.now(), request.id)
-      .run();
-  } catch (err) {
-    console.warn(
-      `Change request ${request.id} applied but its completion record failed to write, so it will not be ` +
-        `announced until that is reconciled (P16-02): ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-}
-
-async function applyChangeRequest(env: Env, event: EventRow, request: ChangeRequestRow): Promise<void> {
-  if (request.kind === 'time_change') {
-    if (event.is_recurring) {
-      // An occurrence override, not a change to the series -- and, following
-      // the existing POST /:eventId/occurrences/:date/cancel endpoint's own
-      // precedent, not guarded on events.revision: an occurrence override has
-      // never been tracked by that column anywhere in the app.
-      // Pass-15 review (P15-06). Admission travels inside the write rather
-      // than sitting in front of it, so it costs no extra query -- the accept
-      // path's price is measured against the Free-plan ceiling (P13-05) and
-      // must not move -- and so two concurrent acceptances cannot both pass a
-      // preflight that neither of them then honours (the P13-10 lesson).
-      //
-      // The statement itself now lives in lib/events.ts as writeOccurrenceMove,
-      // shared with the organizer's own move (IDEAS 94). Unlike the organizer's
-      // move it never un-cancels a date (Pass 24, P24-01): a request filed
-      // before the organizer cancelled the date is not a request to undo that.
-      const written = await writeOccurrenceMove(
-        env,
-        event.id,
-        request.occurrence_date,
-        request.proposed_start_at!,
-        request.proposed_end_at!,
-        { restoreCancelled: false },
-      );
-      // Keeping acceptance honest when the write changed nothing, the same way
-      // P14-11 made it honest when the invite could not be added: a request
-      // that changed nothing must not be reported as accepted. ConflictError
-      // releases the claim; the deadline sweep then declines, and a threshold
-      // vote leaves it for the organizer or the sweep. The read below is on
-      // this refusal path only, to say which of the two refusals it was -- the
-      // accept path's own price is unchanged.
-      if (!written) {
-        const cancelled = await env.DB.prepare(
-          `SELECT 1 FROM event_occurrence_overrides WHERE event_id = ? AND occurrence_date = ? AND is_cancelled = 1`,
-        )
-          .bind(event.id, request.occurrence_date)
-          .first();
-        if (cancelled) {
-          throw new ConflictError('That date has been cancelled, so this request can no longer be accepted');
-        }
-        throw new ConflictError(
-          `This event has reached its limit of ${LIMITS.MAX_OVERRIDES_PER_EVENT} changed occurrences`,
-        );
-      }
-    } else {
-      // The same call PATCH /events/:eventId makes. `revision` is the
-      // request's captured event_revision, not a fresh read -- if the event
-      // moved since the request was filed, this throws ConflictError, which
-      // is exactly the outcome the spec calls for (see "Staleness").
-      await updateEvent(
-        env,
-        event.id,
-        event.guild_id,
-        {
-          isRecurring: false,
-          startAt: request.proposed_start_at!,
-          endAt: request.proposed_end_at!,
-          revision: request.event_revision,
-        },
-        event,
-      );
-    }
+  // D1 serializes the batch. A decline that won before it started keeps
+  // every effect out. A failed statement rolls back the entire batch.
+  const pending: SqlPredicate = {
+    sql: "EXISTS (SELECT 1 FROM event_change_requests WHERE id = ? AND status = 'pending')",
+    binds: [request.id],
+  };
+  let statements: D1PreparedStatement[];
+  let applied: SqlPredicate;
+  if (request.kind === 'add_invitee') {
+    const target = request.target_user_id!;
+    const count = await env.DB.prepare('SELECT COUNT(*) AS n FROM event_invites WHERE event_id = ?')
+      .bind(event.id).first<{ n: number }>();
+    if ((count?.n ?? 0) >= LIMITS.MAX_INVITEES) throw new ValidationError('This event has reached its limit of invitees');
+    statements = await requestedInviteStatements(env, event, target, pending);
+    applied = { sql: 'EXISTS (SELECT 1 FROM event_invites WHERE event_id = ? AND user_id = ?)', binds: [event.id, target] };
+  } else if (event.is_recurring) {
+    const { occurrence_date: date, proposed_start_at: start, proposed_end_at: end } = request;
+    statements = [occurrenceMoveStatement(env, event.id, date, start!, end!, { restoreCancelled: false }, pending)];
+    applied = {
+      sql: `EXISTS (SELECT 1 FROM event_occurrence_overrides WHERE event_id = ? AND occurrence_date = ?
+               AND is_cancelled = 0 AND override_start_at = ? AND override_end_at = ?)`,
+      binds: [event.id, date, start, end],
+    };
   } else {
-    // addInvitesToEvent has no ceiling on an event's *total* invitee count
-    // (MAX_INVITEES only bounds one request's input array), so that's
-    // checked here before calling it.
-    const countRow = await env.DB.prepare(`SELECT COUNT(*) AS n FROM event_invites WHERE event_id = ?`)
-      .bind(event.id)
-      .first<{ n: number }>();
-    if ((countRow?.n ?? 0) >= LIMITS.MAX_INVITEES) {
-      throw new ValidationError('This event has reached its limit of invitees');
-    }
-    // The organizer is the actor: accepting a request is their decision, and
-    // this path passes no group ids anyway.
-    //
-    // Pass-14 review (P14-11 / F-40). notAdded is read rather than discarded.
-    // P13-09 gave addInvitesToEvent an honest answer about who the capacity
-    // guard actually admitted and taught the additive route to surface it;
-    // this caller kept ignoring it. So two organizer accepts racing at the
-    // cap both returned 200 and both requests committed as accepted while
-    // only one person was invited -- a decision recorded for an effect that
-    // never happened.
-    //
-    // ConflictError rather than a silent partial: it travels the release path
-    // applyAndAccept already has, so the claim goes back to pending and the
-    // request stays actionable instead of being closed over nothing.
-    const { notAdded } = await addInvitesToEvent(
-      env,
-      event.id,
-      event.guild_id,
-      [request.target_user_id!],
-      [],
-      event.organizer_id,
-    );
-    if (notAdded.length > 0) {
-      throw new ConflictError('This event filled up before the request could be accepted');
-    }
+    const edit = await buildEventUpdate(env, event.id, event.guild_id, {
+      isRecurring: false, startAt: request.proposed_start_at!, endAt: request.proposed_end_at!,
+      revision: request.event_revision,
+    }, event, pending);
+    statements = edit.statements;
+    applied = { sql: 'EXISTS (SELECT 1 FROM events WHERE id = ? AND mutation_token = ?)', binds: [event.id, edit.mutationToken] };
   }
+
+  const now = Date.now();
+  statements.push(env.DB.prepare(
+    `UPDATE event_change_requests SET status = 'accepted', applied_at = ?, decided_at = ?, decided_by = ?
+     WHERE id = ? AND status = 'pending' AND ${applied.sql}`,
+  ).bind(now, now, decidedBy, request.id, ...applied.binds));
+  const results = await env.DB.batch(statements);
+  if (results[results.length - 1].meta.changes > 0) return;
+
+  const current = await loadChangeRequest(env, event.id, request.id);
+  if (current?.status !== 'pending') throw new ConflictError('This request has already been decided');
+  if (request.kind === 'add_invitee') throw new ConflictError('This event filled up before the request could be accepted');
+  if (event.is_recurring) {
+    const cancelled = await env.DB.prepare(
+      'SELECT 1 FROM event_occurrence_overrides WHERE event_id = ? AND occurrence_date = ? AND is_cancelled = 1',
+    ).bind(event.id, request.occurrence_date).first();
+    if (cancelled) throw new ConflictError('That date has been cancelled, so this request can no longer be accepted');
+    throw new ConflictError(`This event has reached its limit of ${LIMITS.MAX_OVERRIDES_PER_EVENT} changed occurrences`);
+  }
+  throw new ConflictError();
 }
 
 export async function acceptChangeRequest(
