@@ -125,8 +125,8 @@ export default function PrivacyPage() {
           copied into your own {SERVICE_NAME} calendar as read-only personal time,{' '}
           <strong>with their titles, times and descriptions</strong>, visible only to you; anyone else
           still sees only plain blocks of busy time. Cancelled events, and the sessions{' '}
-          {SERVICE_NAME} itself wrote to that calendar, are left out. If there are more than forty,
-          Settings tells you. Switching reading off, or choosing a different calendar, deletes every
+          {SERVICE_NAME} itself wrote to that calendar, are left out. Larger calendars are imported in batches.
+          Settings shows when more events are waiting. Switching reading off, or choosing a different calendar, deletes every
           entry it created. Google's permission covers all your calendars,
           not just the one you choose — that only one is read is enforced by {SERVICE_NAME}'s own
           code, not by Google — so if that matters to you, leave reading off.

@@ -443,7 +443,7 @@ describe('a same-account reconnect is not revoked by the disconnect it interrupt
         before: async () => {
           if (!reconnectAs || reconnected) return;
           reconnected = true;
-          await storeConnection(env, 'u1', 'replacement-refresh', 'replacement-access', 3600, reconnectAs, 'primary');
+          expect(await storeConnection(env, 'u1', 'replacement-refresh', 'replacement-access', 3600, reconnectAs, 'primary')).toBe(false);
         },
       },
     ]);
@@ -452,16 +452,14 @@ describe('a same-account reconnect is not revoked by the disconnect it interrupt
     return fetchStub.bodies.filter((_, i) => fetchStub!.calls[i].includes('/revoke')).map((b) => b ?? '');
   }
 
-  it('skips the revoke when the same account has reconnected', async () => {
+  it('finishes revoking the old grant before accepting a same-account reconnect', async () => {
     const { db, env: base } = setup('paid');
     const env = googleEnv(base);
     const revokes = await runDisconnectWith(db, env, 'same@gmail.com');
+    expect(revokes).toHaveLength(1);
+    expect(await db.prepare("SELECT status FROM google_calendar_connections WHERE user_id = 'u1'").first()).toBeNull();
+    expect(await storeConnection(env, 'u1', 'fresh-refresh', 'fresh-access', 3600, 'same@gmail.com', 'primary')).toBe(true);
 
-    expect(revokes, "the reconnection's own grant was revoked with the one being discarded").toHaveLength(0);
-    const conn = await db
-      .prepare(`SELECT status FROM google_calendar_connections WHERE user_id = 'u1'`)
-      .first<{ status: string }>();
-    expect(conn!.status, 'the replacement connection was dropped').toBe('active');
   });
 
   // The next two are invariant guards, not reproductions: they pass with and

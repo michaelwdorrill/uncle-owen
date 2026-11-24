@@ -162,7 +162,7 @@ meRoutes.get('/export', async (c) => {
     // app's keys for acting on your behalf.
     googleCalendar: `SELECT google_account_email, calendar_id, read_calendar_id, sync_enabled, status,
                        last_synced_at, last_error, connected_at, updated_at, access_token_expires_at,
-                       disconnect_attempts, authorization_failed_at
+                       disconnect_attempts, authorization_failed_at, import_run_id, import_window_start, import_page_token
                      FROM google_calendar_connections WHERE user_id = ?`,
     // google_event_id and calendar_id say which entry in which of your Google
     // calendars this service wrote -- what you would need to find and remove it.
@@ -171,7 +171,7 @@ meRoutes.get('/export', async (c) => {
                           FROM google_event_links WHERE user_id = ?`,
     // A Google connection awaiting your choice of calendar (expires in minutes),
     // credentials left out for the same reason as googleCalendar's.
-    googlePendingConnections: `SELECT id, google_account_email, access_token_expires_at, created_at, expires_at
+    googlePendingConnections: `SELECT id, google_account_email, access_token_expires_at, created_at, expires_at, revoke_after, revoke_lease
                                FROM google_pending_connections WHERE user_id = ?`,
     // Entries written to your Google calendar whose link could not be recorded,
     // kept so they can be found and removed. No credential in the table.
