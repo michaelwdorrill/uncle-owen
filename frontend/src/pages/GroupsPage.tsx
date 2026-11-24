@@ -76,6 +76,11 @@ export default function GroupsPage() {
     reload();
   };
 
+  const leaveGroup = async (group: Group) => {
+    if (!user || !confirm(`Leave "${group.name}"? You will lose access to its roster.`)) return;
+    if (await action.run(() => api.delete(`/groups/${group.id}/members/${user.id}`))) reload();
+  };
+
   const handleDelete = async (group: Group) => {
     if (!confirm(`Delete group "${group.name}"?`)) return;
     if (await action.run(() => api.delete(`/groups/${group.id}`))) reload();
@@ -162,7 +167,7 @@ export default function GroupsPage() {
                   </div>
                 )}
               </div>
-              {g.createdBy === user?.id && (
+              {g.createdBy === user?.id ? (
                 <div className="flex gap-2">
                   <button
                     onClick={() => setEditing(g)}
@@ -176,7 +181,10 @@ export default function GroupsPage() {
                   >
                     Delete
                   </button>
+                  <span className="text-xs text-muted">To leave as owner, transfer ownership or delete the group.</span>
                 </div>
+              ) : (
+                <button className={buttonClass('secondary', 'sm')} onClick={() => leaveGroup(g)}>Leave group</button>
               )}
             </li>
           ))}

@@ -679,7 +679,12 @@ export async function resolvePastDeadlineChangeRequests(env: Env, budget?: WorkB
       if (!accepted) {
         if (budget && !budget.trySpend(DECLINE_COST_PER_REQUEST)) break;
         await env.DB.prepare(
-          `UPDATE event_change_requests SET status = 'declined', decided_at = ? WHERE id = ? AND status = 'pending'`,
+          `UPDATE event_change_requests SET status = 'declined', decided_at = ?,
+             decision_note = CASE WHEN EXISTS (
+               SELECT 1 FROM event_occurrence_overrides o WHERE o.event_id = event_change_requests.event_id
+                 AND o.occurrence_date = event_change_requests.occurrence_date AND o.is_cancelled = 1
+             ) THEN 'That occurrence was cancelled.' ELSE NULL END
+           WHERE id = ? AND status = 'pending'`,
         )
           .bind(now, request.id)
           .run();

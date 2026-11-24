@@ -28,9 +28,9 @@ export default function LegalLayout({
             <Link to="/privacy" className="hover:text-ink-soft">
               Privacy
             </Link>
-            <Link to="/changelog" className="hover:text-ink-soft">
+            <a href="/#/changelog" className="hover:text-ink-soft">
               Changelog
-            </Link>
+            </a>
           </nav>
         </div>
       </header>

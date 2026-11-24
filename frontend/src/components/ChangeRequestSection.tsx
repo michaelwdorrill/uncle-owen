@@ -197,7 +197,7 @@ export default function ChangeRequestSection({
   const [friends, setFriends] = useState<Friend[] | null>(null);
 
   if (!isInvitee && !isOrganizer) return null;
-  if (requests.length === 0 && !isInvitee) return null;
+  if (requests.length === 0 && (!isInvitee || event.status !== 'active')) return null;
 
   const myRequests = requests.filter((r) => r.requesterId === userId);
   // Voting is invitee-only (the spec: "every current invitee" votes; the

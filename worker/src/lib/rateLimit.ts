@@ -1,3 +1,4 @@
+import { html } from 'hono/html';
 import type { Env } from '../env';
 
 // IDEAS item 92 / release-bar clause 3: "every unauthenticated endpoint that
@@ -138,4 +139,12 @@ export async function pruneOAuthCallbackCounts(env: Env): Promise<void> {
   await env.DB.prepare(`DELETE FROM oauth_callback_counts WHERE window_start < ?`)
     .bind(now - (now % WINDOW_MS))
     .run();
+}
+
+/** Browser landing page for Discord callbacks that hit the shared minute limit. */
+export function oauthRetryPage(returnUrl: string) {
+  return html`<!doctype html><html lang="en"><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1"><title>Try again in a minute · Uncle Owen</title>
+    <main><h1>Try again in a minute</h1><p>There have been too many Discord sign-in attempts from this address.
+    Wait one minute, then return to Uncle Owen to start again.</p><a href="${returnUrl}">Return to Uncle Owen</a></main></html>`;
 }
