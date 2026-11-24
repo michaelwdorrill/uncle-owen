@@ -28,7 +28,6 @@ import {
   type DmRecipient,
 } from '../lib/outbox';
 import { editBotDm } from '../lib/discord';
-import { activeLaunchAnnouncement, launchAnnouncementImage, launchAnnouncementText } from '../lib/launchAnnouncement';
 import { cancelButton, cancelOccurrenceButton, linkButton, pollSelect, rsvpButtons } from '../lib/dmComponents';
 import { LIMITS } from '../lib/validate';
 import { chunkIds, chunkRows, placeholders } from '../lib/d1';
@@ -3624,80 +3623,6 @@ async function runIsolated(name: string, fn: () => Promise<void>): Promise<void>
   }
 }
 
-// The 1.0 launch announcement's DM (lib/launchAnnouncement.ts). LAUNCH-ONLY:
-// removed in 1.1, with everything else listed in docs/IDEAS.md item 105.
-//
-// Who gets it, per Michael's three answers (9 Nov 2026): everyone with
-// notifications on -- the toggle is respected, as for every other DM; the
-// pop-up still reaches people who turned them off -- and only people still in
-// an allow-listed server, the same rule every other DM follows.
-//
-// Costs nothing when no announcement is live (no query at all, which is what
-// keeps pass9's empty-tick ceiling), and nothing once it is finished: the
-// first tick that finds nobody left to send to records that in the cursor
-// store, which every tick already reads in one statement.
-//
-// Where it runs, and how much it takes. It first went last in the tick, on the
-// reasoning that a launch note can wait fifteen minutes. On the sandbox
-// (B10, 9 Nov) a temporary per-step trace showed every tick reaching it with
-// nothing left, five ticks running: "last" meant "never" on a busy install,
-// and production's load can't be measured before the launch. So it runs near
-// the front, right after membership revalidation, and takes at most
-// LAUNCH_ANNOUNCEMENT_PER_TICK deliveries: always some progress, and most of
-// the tick still left for invites and reminders. Thirty people take eight
-// ticks, about two hours, and then it costs nothing at all.
-//
-// Never-attempted rows sort first, so people still waiting on a first try are
-// not stuck behind a retry backing off.
-const LAUNCH_ANNOUNCEMENT_PER_TICK = 4;
-
-async function sweepLaunchAnnouncement(env: Env, budget: TickBudget, cursors: CursorStore): Promise<void> {
-  const announcement = activeLaunchAnnouncement(env);
-  if (!announcement || cursors.get('launch_announcement') === announcement.id) return;
-  if (budget.exhausted || !budget.trySpend(1)) return;
-
-  const { results } = await env.DB.prepare(
-    `SELECT u.id, u.notifications_enabled, u.dm_channel_id, u.timezone
-     FROM users u
-     LEFT JOIN announcement_log al ON al.user_id = u.id AND al.announcement_id = ?
-     WHERE u.notifications_enabled = 1
-       AND EXISTS (
-         SELECT 1 FROM user_guild_membership m
-         JOIN guilds g ON g.id = m.guild_id AND g.is_active = 1
-         WHERE m.user_id = u.id AND m.is_member = 1 AND m.verified_at >= ?
-       )
-       AND (al.id IS NULL OR (al.delivered_at IS NULL AND al.failed_at IS NULL AND al.attempt_count < ?))
-     ORDER BY (al.id IS NOT NULL), u.id
-     LIMIT ?`,
-  )
-    .bind(announcement.id, membershipCutoff(), MAX_DELIVERY_ATTEMPTS, Math.max(1, Math.min(LAUNCH_ANNOUNCEMENT_PER_TICK, budget.deliveriesAffordable)))
-    .all<ParticipantRow>();
-
-  if (results.length === 0) {
-    cursors.set('launch_announcement', announcement.id);
-    return;
-  }
-
-  const image = launchAnnouncementImage(announcement);
-  for (const user of results) {
-    if (budget.exhausted) return;
-    try {
-      await deliverThroughOutbox(
-        env,
-        'announcement_log',
-        { user_id: user.id, announcement_id: announcement.id },
-        user,
-        launchAnnouncementText(env, announcement),
-        budget,
-        null,
-        image,
-      );
-    } catch (err) {
-      console.error(`sweepLaunchAnnouncement failed for user ${user.id}:`, err);
-    }
-  }
-}
-
 export async function runReminderSweep(env: Env): Promise<void> {
   // Order matters: transition deadline-passed polls first so their invitees
   // get a poll_resolved DM in the same tick, then invites, then time-based
@@ -3746,9 +3671,6 @@ export async function runReminderSweep(env: Env): Promise<void> {
   }
 
   await runIsolated('membershipRevalidation', () => sweepMembershipRevalidation(env, budget));
-  // LAUNCH-ONLY (1.0); removed in 1.1. Near the front, capped per tick -- see
-  // sweepLaunchAnnouncement for why it isn't last.
-  await runIsolated('launchAnnouncement', () => sweepLaunchAnnouncement(env, budget, cursors));
   await runIsolated('pollDeadlines', () => sweepPollDeadlines(env, budget));
   await runIsolated('changeRequestDeadlines', () => sweepChangeRequestDeadlines(env, budget));
   const cancelledInviteEditsDue: CancelledEvent[] = [];

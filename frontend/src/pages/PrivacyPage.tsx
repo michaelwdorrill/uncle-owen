@@ -61,8 +61,7 @@ export default function PrivacyPage() {
               it was sent, and whether it was delivered — so that nothing is sent to you twice, and so
               that a message can be updated later (for example to show the answer you pressed). Also
               the ID of the direct-message channel between you and the bot, recorded the first time it
-              messages you. This includes the one announcement sent when version 1.0 launched, which
-              went only to people with notifications switched on.
+              messages you.
             </>,
             <>
               <strong>Login sessions.</strong> When each was created, roughly when it was last used (to
@@ -79,8 +78,8 @@ export default function PrivacyPage() {
               because you no longer share a server with the app).
             </>,
             <>
-              <strong>Whether you've seen the 1.0 launch picture</strong> that appears once when you
-              first open the app after the release, so it isn't shown to you again.
+              <strong>Historical launch records.</strong> If you received the version 1.0 message or saw
+              its picture, your account export includes the delivery record or the recorded acknowledgement.
             </>,
           ]}
         />
@@ -332,8 +331,8 @@ export default function PrivacyPage() {
             </>,
             <>
               <strong>Messages the bot sent you (text and delivery record):</strong> until the event
-              or group they were about is removed, or your account is deleted. The two warnings
-              before inactivity deletion, and the 1.0 launch announcement, stay until your account is
+              or group they were about is removed, or your account is deleted. Historical launch records and warnings
+              before inactivity deletion stay until your account is
               deleted.
             </>,
             <>

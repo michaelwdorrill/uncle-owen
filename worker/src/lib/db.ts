@@ -533,7 +533,7 @@ export async function deleteUserCompletely(env: Env, userId: string): Promise<vo
     env.DB.prepare(`DELETE FROM group_members WHERE user_id = ?`).bind(userId),
     env.DB.prepare(`DELETE FROM group_nudge_log WHERE user_id = ?`).bind(userId),
     env.DB.prepare(`DELETE FROM account_purge_warnings WHERE user_id = ?`).bind(userId),
-    // The 1.0 launch announcement DM (LAUNCH-ONLY, removed in 1.1).
+    // Historical 1.0 launch records are erased with the account.
     env.DB.prepare(`DELETE FROM announcement_log WHERE user_id = ?`).bind(userId),
     // IDEAS item 9 / specs/0015: requested_by has no ON DELETE action, same
     // reasoning as every other child table here -- the request's own record
