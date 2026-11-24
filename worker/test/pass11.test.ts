@@ -1701,7 +1701,29 @@ describe('the Google sync tells the truth about what it did (R16, R19, R17, R18)
   // Google documents nextPageToken arriving with a short page, so "fewer than
   // maxResults" is not the same as "that was all of it". The fields mask used
   // to strip the token, making the two indistinguishable.
-  it('treats a nextPageToken as truncation even on a short page', async () => {
+  it('resumes past 40 events after a failed second page and prunes only on completion', async () => {
+    const { db, env: base } = setup();
+    const env = googleEnv(base);
+    await seedReadConnection(db, 'u1');
+    const at = Date.now() + DAY_MS;
+    const items = Array.from({ length: 40 }, (_, i) => calendarEvent('g' + i, at, at + HOUR_MS));
+    fetchStub = stubFetch([TOKEN_RULE, { match: '/events', status: 200, body: { timeZone: 'UTC', nextPageToken: 'page-two', items } }]);
+    await sweepGoogleCalendar(env, new TickBudget('paid'));
+    expect(await countRows(db, 'personal_events', 'google_event_id IS NOT NULL')).toBe(40);
+    fetchStub.restore();
+    fetchStub = stubFetch([TOKEN_RULE, { match: 'pageToken=page-two', status: 503, body: {} }]);
+    await sweepGoogleCalendar(env, new TickBudget('paid'));
+    expect(await countRows(db, 'personal_events', 'google_event_id IS NOT NULL')).toBe(40);
+    fetchStub.restore();
+    fetchStub = stubFetch([TOKEN_RULE, { match: 'pageToken=page-two', status: 200,
+      body: { timeZone: 'UTC', items: [calendarEvent('g40', at, at + HOUR_MS)] } }]);
+    await sweepGoogleCalendar(env, new TickBudget('paid'));
+    expect(await countRows(db, 'personal_events', 'google_event_id IS NOT NULL')).toBe(41);
+    expect((await db.prepare("SELECT import_page_token FROM google_calendar_connections WHERE user_id = 'u1'")
+      .first<{ import_page_token: string | null }>())?.import_page_token).toBeNull();
+  });
+
+  it('resumes a short page at the returned token', async () => {
     const { db, env: base } = setup();
     const env = googleEnv(base);
     await seedReadConnection(db, 'u1');
@@ -1725,7 +1747,7 @@ describe('the Google sync tells the truth about what it did (R16, R19, R17, R18)
     const conn = await db
       .prepare(`SELECT last_error FROM google_calendar_connections WHERE user_id = 'u1'`)
       .first<{ last_error: string | null }>();
-    expect(conn?.last_error).toMatch(/only the first 40/i);
+    expect(conn?.last_error).toMatch(/more events are being imported/i);
   });
 
   // R19. Google's timeMin bounds an event's END, so an in-progress event is

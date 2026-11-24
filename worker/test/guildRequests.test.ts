@@ -115,6 +115,30 @@ describe('GET /guild-requests/callback', () => {
   // IDEAS item 57: an administered guild that's already allow-listed used to
   // be dropped from this list entirely, with nothing explaining why -- Michael
   // hit exactly this on the first real run of the flow.
+  it('opens the picker for 60 administered servers with bounded database and Discord reads', async () => {
+    const { db, env } = setup();
+    await seedUser(db, 'requester');
+    const admin = Array.from({ length: 60 }, (_, i) => ({ id: String(100 + i), name: 'Server ' + i, owner: true }));
+    for (const g of admin.slice(0, 55)) await seedGuild(db, g.id);
+    const connect = await call(env, '/guild-requests/connect');
+    const state = new URL(connect.headers.get('Location')!).searchParams.get('state');
+    fetchStub = stubFetch([
+      TOKEN_RULE, { match: '/users/@me/guilds?limit=200', status: 200, body: admin.slice(0, 51) },
+      guildsRule(admin), userRule('requester'),
+    ]);
+    db.resetQueryCount();
+    const response = await call(env, '/guild-requests/callback?code=test&state=' + state, {
+      headers: { Cookie: setCookieValue(connect) },
+    });
+    expect(response.status).toBe(302);
+    const encoded = new URLSearchParams(response.headers.get('Location')!.split('?')[1]).get('data');
+    const rows = JSON.parse(atob(encoded!)) as { alreadyAdded?: boolean; botMissing?: boolean; token?: string }[];
+    expect(rows.filter(r => r.alreadyAdded)).toHaveLength(51);
+    expect(rows.filter(r => r.botMissing)).toHaveLength(4);
+    expect(rows.filter(r => r.token)).toHaveLength(5);
+    expect(db.queryCount + fetchStub.calls.length).toBeLessThan(50);
+  });
+
   it('flags an already-allow-listed administered guild instead of omitting it', async () => {
     const { db, env } = setup();
     await seedGuild(db, 'already-active');

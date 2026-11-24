@@ -39,6 +39,12 @@ end. It also ranks the five steps to do first if time is short.
 
 ---
 
+## Automated browser results, 24 November 2026
+
+Chromium loaded both built frontends. The sandbox banner appeared only on the sandbox build. The production build served readable Privacy and Terms pages with JavaScript disabled.
+
+Using a local API fixture, a returning user accepted the policy and the calendar loaded on the first attempt. At 22:00 UTC a blank event defaulted to the next evening, and a new poll deadline defaulted to today. The light theme persisted after reload. Month chips and Agenda gutters displayed eight distinct group colours. The reduced sky opacity kept the light calendar controls legible. Live account checks are tracked separately below.
+
 ## Before merging a release
 
 - [ ] Open the **production** Discord application in the Developer Portal. Under **OAuth2 → Redirects**, compare both registered URLs against SETUP section 1 and the deployed production Worker origin. Verify the exact scheme, host and paths `/auth/callback` and `/guild-requests/callback`. Sign-in exercises only the first.

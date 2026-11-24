@@ -217,6 +217,17 @@ describe('ownership transfer when the owner leaves', () => {
 });
 
 describe('group permissions stay owner-only for administration', () => {
+  it('lets a member leave and removes access immediately', async () => {
+    const { db, env } = setup();
+    await seedPeople(db, ['owner', 'alice']);
+    await seedGroup(db, 'g1', 'owner', ['owner', 'alice']);
+    fetchStub = stubFetch([membershipRule(200)]);
+    const headers = await authHeaders(env, 'alice');
+    expect((await app.request('https://worker.test/groups/g1/members/alice', { method: 'DELETE', headers }, env)).status).toBe(200);
+    expect((await app.request('https://worker.test/groups/g1', { headers }, env)).status).toBe(404);
+    expect(await db.prepare("SELECT created_by FROM groups WHERE id = 'g1'").first()).toMatchObject({ created_by: 'owner' });
+  });
+
   it('a non-owner member cannot add members, rename or delete', async () => {
     const { db, env } = setup();
     await seedPeople(db, ['owner', 'alice', 'carol']);

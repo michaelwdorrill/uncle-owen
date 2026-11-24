@@ -736,6 +736,8 @@ export async function revalidateStaleMemberships(
        FROM user_guild_membership m
        JOIN guilds g ON g.id = m.guild_id
        WHERE m.is_member = 1 AND g.is_active = 1 AND m.verified_at < ?
+         -- These fixture IDs cannot be Discord snowflakes; they only exist in seeded databases.
+         AND m.user_id NOT GLOB 'seed-user-*' AND m.user_id NOT GLOB 'gdemo-user-*'
      )
      ORDER BY turn, verified_at
      LIMIT ?`,

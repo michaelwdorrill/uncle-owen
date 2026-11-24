@@ -5,6 +5,7 @@ import { filterActiveGuildMembers } from './db';
 import type { EventRow } from './events';
 import { commonServerSet } from './groups';
 import { newId } from './ids';
+import { isSeriesOccurrence } from './recurrence';
 import {
   assertBoolean,
   assertOneOf,
@@ -1476,7 +1477,8 @@ export async function buildEventUpdate(
     // from an earlier series before moving a matching one-off answer.
     statements.push(guardedStatement(`DELETE FROM event_attendance WHERE event_id = ? AND occurrence_date != ''`, eventId));
     const originalDate = stored.start_at == null ? null : localDateKey(stored.start_at, stored.timezone);
-    if (originalDate === input.recurrence.startDate) {
+    const rule = { ...input.recurrence, byWeekday: input.recurrence.byWeekday?.join(',') ?? null };
+    if (originalDate === rule.startDate && isSeriesOccurrence(rule, input.timezone ?? stored.timezone, originalDate)) {
       statements.push(guardedStatement(
         `UPDATE event_attendance SET occurrence_date = ? WHERE event_id = ? AND occurrence_date = ''`,
         originalDate, eventId,
