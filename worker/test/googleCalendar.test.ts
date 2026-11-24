@@ -4,7 +4,7 @@ import { signJwt } from '../src/lib/jwt';
 import { createSession } from '../src/lib/sessions';
 import { signToken } from '../src/lib/signedToken';
 import { seal, unseal } from '../src/lib/crypto';
-import { GOOGLE_CONNECT_PURPOSE } from '../src/lib/googleCalendar';
+import { GOOGLE_CONNECT_PURPOSE, insertCalendarEvent, patchCalendarEvent, storePendingConnection } from '../src/lib/googleCalendar';
 import { sweepGoogleCalendar } from '../src/cron/googleSync';
 import { computeBusyBlocksForUsers } from '../src/lib/freeBusy';
 import { runReminderSweep } from '../src/cron/reminders';
@@ -1422,5 +1422,63 @@ describe('erasure and referential integrity', () => {
 
     expect(await countRows(db, 'events', "id = 'evt-old'")).toBe(0);
     expect(await countRows(db, 'google_event_links')).toBe(0);
+  });
+});
+
+describe('remote event creation reconciliation', () => {
+  const payload = { title: 'Game', startAt: 100000, endAt: 200000, guildName: null,
+    eventUrl: 'https://ui.test/#/events/game', eventId: 'game', occurrenceDate: '' };
+
+  it('recovers one remote event after losing the local mapping, and scopes IDs to the destination', async () => {
+    const remote = new Map<string, Record<string, unknown>>();
+    const fake = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      if (init?.method === 'POST') {
+        const key = url + '/' + body.id;
+        if (remote.has(key)) return new Response('{}', { status: 409 });
+        remote.set(key, body);
+        return Response.json({ id: body.id });
+      }
+      if (init?.method === 'PATCH') Object.assign(remote.get(url)!, body);
+      return Response.json(remote.get(url));
+    });
+    try {
+      const insert = (cal: string) => insertCalendarEvent('access', cal, payload, 'member', () => true);
+      const first = await insert('primary');
+      expect(first.ok).toBe(true);
+      if (!first.ok) throw new Error('expected a created event');
+      await patchCalendarEvent('access', 'primary', first.value.id, { ...payload, title: 'Updated' });
+      expect([...remote.values()][0].summary).toBe('Updated');
+      expect(await insert('primary')).toMatchObject(first);
+      expect(remote.size).toBe(1);
+      expect((await insert('other'))).not.toEqual(first);
+      expect(remote.size).toBe(2);
+      const entry = [...remote.values()][0];
+      entry.extendedProperties = {};
+      expect(await insert('primary')).toMatchObject({ ok: false, status: 409 });
+      expect(remote.size).toBe(2);
+      entry.status = 'cancelled';
+      expect(await insert('primary')).toMatchObject({ ok: true });
+      expect(remote.size).toBe(3);
+    } finally { fake.mockRestore(); }
+  });
+});
+
+describe('expired pending Google connections', () => {
+  it.each([false, true])('cleans an abandoned grant while protecting an active grant shared=%s', async shared => {
+    const { db, env: base } = setup();
+    const env = googleEnv(base);
+    await seedMember(db, 'u1');
+    await seedConnection(db, 'u1', { lastSyncedAt: Date.now() });
+    await db.prepare("UPDATE google_calendar_connections SET google_account_email = 'active@example.test'").run();
+    const id = await storePendingConnection(env, 'u1', 'abandoned', 'access', 3600,
+      shared ? 'active@example.test' : 'other@example.test');
+    await db.prepare('UPDATE google_pending_connections SET expires_at = 0 WHERE id = ?').bind(id).run();
+    fetchStub = stubFetch([REVOKE_RULE]);
+    await sweepGoogleCalendar(env, new TickBudget('free'));
+    expect(fetchStub.calls.filter(url => url.includes('/revoke'))).toHaveLength(shared ? 0 : 1);
+    expect(await countRows(db, 'google_pending_connections')).toBe(0);
+    expect(await countRows(db, 'google_calendar_connections')).toBe(1);
   });
 });

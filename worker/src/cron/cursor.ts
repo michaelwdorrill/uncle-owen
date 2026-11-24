@@ -16,6 +16,7 @@ import type { Env } from '../env';
 // bounded number of ticks.
 
 export type CursorName =
+  | 'notification_turn'
   | 'reminders_single'
   | 'reminders_recurring'
   | 'voice_recurring'

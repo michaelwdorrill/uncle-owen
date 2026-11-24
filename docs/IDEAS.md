@@ -1989,6 +1989,42 @@ above calls the better outcome: nothing currently tells the invitee the
 event is already underway. Worth a small follow-up pass if that silence
 turns out to matter in practice.
 
+### 109b. Launch night: "Couldn't load your server list" after agreeing to the policy (fixed in 1.0.1)
+
+Michael's first production visit on 1.0 (9 Nov 2026, 23:15 UTC). `GuildProvider`
+fetched `/guilds` as soon as someone was signed in, which included the moment
+the version-6 agreement screen was up. `/guilds` is policy-gated, so it
+answered 403, the error stuck, and agreeing didn't refetch: every returning
+user's first sight of 1.0 was a red banner until they pressed Try again. The
+fetch now waits on `policyAccepted()` (`frontend/src/lib/policyGate.ts`).
+Reproduced headless with the launch's exact state (agreed to 2, version 6 in
+force, `/guilds` refusing until agreement): before the fix, one `/guilds`
+call at version 2 and the banner; after, the first call is at 6 and there's
+no banner.
+
+Why the walkthrough missed it: on the sandbox the agreement screen is
+followed by the 1.0 pop-up, which covers the banner. Any other app-level
+fetch of gated data needs the same treatment, so it belongs in IDEAS 108's
+review sweep.
+
+### 110. Launch night: production's Discord app lacked the add-bot redirect
+
+P1 (9 Nov 2026). The first production add-bot request stopped at Discord's
+"Invalid OAuth2 redirect_uri". The self-service add-bot flow (specs/0015)
+arrived after 0.7.2, and production's Discord application had only ever been
+given the login redirect (`/auth/callback`), never
+`/guild-requests/callback`. SETUP lists both, but nothing checks them, and
+the sandbox's application had both, so the walkthrough couldn't catch it.
+Michael added the redirect in the portal and the flow then worked end to end
+(email in the inbox, DKIM-verified, Reject link fine).
+
+The same class as IDEAS 109: a difference only production has. Two
+follow-ups for 1.0.1: add a line to RELEASE-TESTING's pre-merge list
+("production's Discord app has exactly the redirects SETUP section 1
+lists"), and consider having the Worker log, once, which OAuth redirect URIs
+it will use. Discord's API offers no way to read an app's registered
+redirects with a bot token, so an automated check isn't possible.
+
 ## Parked until after 1.0
 
 Deliberately deferred past 1.0, per the rule in "How this file is kept" above.
@@ -2001,6 +2037,8 @@ is because that is what keeps the distinction meaningful rather than
 decorative.
 
 ### 64. Get the Google OAuth app verified, so users stop seeing the unverified warning
+
+**Un-parked for 1.0.1 (9 Nov 2026, Michael), now that Google is live in production.** The plan, status, scope justifications and video shot list are in `docs/GOOGLE-VERIFICATION.md`. Domain, branding and policy are done; still to do are the home page description and plain-path legal pages (code), the video and the submission.
 
 Anyone connecting a Google calendar meets a Google interstitial first. Which
 one depends on the app's publishing status, and neither of the two available

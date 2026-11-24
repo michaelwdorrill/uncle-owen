@@ -275,8 +275,7 @@ So that nothing happens to your plans without you knowing it can:
   you'd pressed "Delete my account". You'll be sent a Discord message two weeks
   and one week before (if Discord accepts messages from the bot). It is paused
   while you're organizing, or invited to and haven't declined, anything still
-  to come — which includes any repeating event that hasn't been cancelled, even
-  one whose dates have all passed.
+  to come — including a repeating event that still has a date to come.
 
 Messages are sent through Discord, and the service retries a failed delivery,
 but it cannot guarantee you receive one: Discord may refuse it if you block the
@@ -505,7 +504,7 @@ Every factual statement in Parts B and C, and where it is made true.
 | IP never stored; a keyed code of it kept with a per-minute count, not linked to an account, deleted within ~15 min | `worker/src/lib/rateLimit.ts:63` (`callbackBucket`: HMAC under `JWT_SIGNING_KEY`), `:91` (deletes earlier minutes on each callback), `:136` + `cron/reminders.ts:3635` (deleted every 15-minute tick); migration 0048 has no IP or user column | `rateLimit.test.ts` "never stores the address", "removes earlier minutes", "the cron tick removes a finished minute"; grep for `CF-Connecting-IP` |
 | The three limited routes | `auth.ts:176`, `google.ts:208`, `guildRequests.ts:103` | read; timetable R92 |
 | Bot-add request stores server id/name, requester, times | `guild_add_requests` | schema |
-| Google Calendar is live in production (F3); writes every non-declined, non-cancelled session you organize or are invited to in the next 60 days, pending and maybe included (V6-01); reads one chosen calendar 62 days ahead, ≤40 events, skipping cancelled ones and its own writes | `wrangler.toml` `GOOGLE_SYNC_MODE = "live"`; `googleSync.ts:200-203` (`desiredOccurrencesFor`), `SYNC_WINDOW_MS` `:46`, `MAX_IMPORTED_EVENTS_PER_SYNC` `:117`; `googleCalendar.ts:869` | read; P1 after merge |
+| Google Calendar is live in production (F3); writes every non-declined, non-cancelled session you organize or are invited to in the next 60 days, pending and maybe included (V6-01); reads one chosen calendar 62 days ahead, 40 events per page, skipping cancelled ones and its own writes | `wrangler.toml` `GOOGLE_SYNC_MODE = "live"`; `googleSync.ts:200-203` (`desiredOccurrencesFor`), `SYNC_WINDOW_MS` `:46`, `MAX_IMPORTED_EVENTS_PER_SYNC` `:117`; `googleCalendar.ts:869` | read; P1 after merge |
 | No trackers/analytics/ad networks | no third-party scripts in `frontend/`; fonts self-hosted (`frontend/src/fonts.css`, `noRemoteAssets.test.ts`) | read; network tab on the site |
 | Browser storage keys | `jps_token`, `jps_identity`, `jps_login_verifier`, `jps_pending_revocation:<token>` (one key per pending sign-out, holding the retired token so it can be revoked later; `frontend/src/auth/pendingRevocation.ts:32`) plus the legacy `jps_pending_revocations` array migrated away on read (`:39`), `jps_selected_guild`, `uo.view`, `uo.scenery` | grep `frontend/src` |
 | Three short-lived cookies | `oauth_state` (`auth.ts:14`), `guild_verify_state` (`guildRequests.ts:34`), `google_connect_nonce` (`google.ts:46`) — all HttpOnly, 600 s, scoped to their own path | read `setCookie` options |
@@ -522,7 +521,7 @@ Every factual statement in Parts B and C, and where it is made true.
 | No admin page for events/answers/personal time | `routes/admin.ts` has only users, guilds, guild-requests | read |
 | Minimum attendees: optional deadline; auto-cancel at the deadline or on the decline that takes it below; otherwise the organizer is messaged | `lib/attendance.ts` `recordRsvp` (~`:523`); `sweepMinimumAttendeesDeadlines`; `sendCancelledEventNotice` — **draft 2, D-17** | walkthrough 4.x |
 | Poll day becomes an event; **every** answer carried (yes/no/maybe → accepted/declined/tentative); called off below threshold | `reminders.ts` `createFannedOutEvent`, `VOTE_AS_RSVP` (`lib/polls.ts`) — **draft 2, P24-02: only yes was carried, so an organizer's no showed as yes** | `confirmedDayThreshold.test.ts`; walkthrough 5.10–5.14 |
-| Inactivity deletion at 365 days; warnings at 351/358; paused while organizing/invited to future plans **or to any uncancelled repeating event**; warnings sent even with notifications off | `reminders.ts:3096`–`:3098`; stake query `start_at IS NULL OR start_at > ?` (`:3151`), and every series has `start_at IS NULL` — **draft 2, D-16** | read |
+| Inactivity deletion at 365 days, warnings at 351/358, paused while organizing or invited to future plans including future occurrences | `hasUpcomingStake` in `worker/src/cron/reminders.ts`, recurrence coverage in `worker/test/staleAccounts.test.ts` | verified locally |
 | Cancelled events / finished polls deleted 90 days after they were last changed; ordinary past events kept | `reminders.ts:193`; the purge keys on `updated_at` (`:3474`) — **draft 2, D-18** | read |
 | Deletion removes the listed data from the live database, immediately; organised events go for everyone; no cancellation DM; Google entries already written stay; recovery copies for the Time Travel window | `worker/src/lib/db.ts` `deleteUserCompletely` (one batch; every FK into `users` handled — verified by the Fable review); Google left at `db.ts:586`; F6 | walkthrough 6.6/6.7 |
 | Export: everything held about you except encrypted credentials | `worker/src/routes/me.ts` export; `worker/test/exportCompleteness.test.ts` checks every explicit projection against the schema — **draft 2, D-07** | download it; compare with Part E |

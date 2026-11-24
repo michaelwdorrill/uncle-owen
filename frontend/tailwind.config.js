@@ -6,58 +6,41 @@
 // this file would be the whole visual diff. This is that payoff: the values
 // below moved, and nothing else had to.
 //
-// Dark-first, single theme. 0009 defines a light ("noon at the homestead")
-// column too and the ramp below is built to accept it, but shipping and
-// reviewing both doubles the surface, so light is deliberately out of v0.4.
+// Dark and light semantic colors are defined in src/index.css.
 export default {
   content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
   theme: {
     extend: {
       colors: {
-        // The ground runs warm black to lit sand. No cold grey anywhere in
-        // the app -- that absence is most of what makes it read as desert.
-        ground: '#1A1410', // page
-        surface: '#241C16', // cards, bars, panels
-        raised: '#2C231B', // input fills, hover states
-        'raised-hi': '#3A2E24', // a step above raised
-
-        edge: '#372B22', // hairline borders
-        'edge-strong': '#4A3A2C', // control borders
-
-        ink: '#F0E2CC', // primary text -- parchment, not white
-        'ink-soft': '#E4D5BE',
-        'ink-dim': '#D6C0A0',
-        muted: '#A8927A', // secondary text
-        faint: '#85715C', // tertiary text, footers
-        fainter: '#6B5945', // barely-there text
-
-        // The two suns. Tatoo I is the larger, warmer one and carries primary
-        // actions; Tatoo II is smaller and paler and does the lighter-weight
-        // work -- accent text, the second of the two shadows.
-        accent: '#E8913A', // Tatoo I
-        'accent-hover': '#F2A855',
-        'accent-text': '#F0A34F',
-        'on-accent': '#1A1008', // near-black on an orange fill, not white
-        'accent-2': '#F2C879', // Tatoo II
-
-        // The two counterpoints that stop this being a generic warm palette.
-        // Vaporator teal is load-bearing rather than decorative: personal time
-        // reads cool against warm group sessions, a distinction the old
-        // slate-600 made only faintly.
-        dusk: '#8B6BA0', // the violet band of the sunset
-        moisture: '#6FA8A8', // vaporator condensate
-
-        // Status, warmed to sit on sand rather than on slate.
-        danger: '#C4432E',
-        'danger-hover': '#D9553D',
-        'danger-text': '#EE8A6E',
-        'danger-surface': '#3A1D14',
-        warning: '#C08A2A',
-        'warning-text': '#E4B15C',
-        'warning-surface': '#33260F',
-        success: '#6E8C4A',
-        'success-text': '#A8C077',
-        'success-surface': '#222A15',
+        ground: 'rgb(var(--uo-ground) / <alpha-value>)',
+        surface: 'rgb(var(--uo-surface) / <alpha-value>)',
+        raised: 'rgb(var(--uo-raised) / <alpha-value>)',
+        'raised-hi': 'rgb(var(--uo-raised-hi) / <alpha-value>)',
+        edge: 'rgb(var(--uo-edge) / <alpha-value>)',
+        'edge-strong': 'rgb(var(--uo-edge-strong) / <alpha-value>)',
+        ink: 'rgb(var(--uo-ink) / <alpha-value>)',
+        'ink-soft': 'rgb(var(--uo-ink-soft) / <alpha-value>)',
+        'ink-dim': 'rgb(var(--uo-ink-dim) / <alpha-value>)',
+        muted: 'rgb(var(--uo-muted) / <alpha-value>)',
+        faint: 'rgb(var(--uo-faint) / <alpha-value>)',
+        fainter: 'rgb(var(--uo-fainter) / <alpha-value>)',
+        accent: 'rgb(var(--uo-accent) / <alpha-value>)',
+        'accent-hover': 'rgb(var(--uo-accent-hover) / <alpha-value>)',
+        'accent-text': 'rgb(var(--uo-accent-text) / <alpha-value>)',
+        'on-accent': 'rgb(var(--uo-on-accent) / <alpha-value>)',
+        'accent-2': 'rgb(var(--uo-accent-2) / <alpha-value>)',
+        dusk: 'rgb(var(--uo-dusk) / <alpha-value>)',
+        moisture: 'rgb(var(--uo-moisture) / <alpha-value>)',
+        danger: 'rgb(var(--uo-danger) / <alpha-value>)',
+        'danger-hover': 'rgb(var(--uo-danger-hover) / <alpha-value>)',
+        'danger-text': 'rgb(var(--uo-danger-text) / <alpha-value>)',
+        'danger-surface': 'rgb(var(--uo-danger-surface) / <alpha-value>)',
+        warning: 'rgb(var(--uo-warning) / <alpha-value>)',
+        'warning-text': 'rgb(var(--uo-warning-text) / <alpha-value>)',
+        'warning-surface': 'rgb(var(--uo-warning-surface) / <alpha-value>)',
+        success: 'rgb(var(--uo-success) / <alpha-value>)',
+        'success-text': 'rgb(var(--uo-success-text) / <alpha-value>)',
+        'success-surface': 'rgb(var(--uo-success-surface) / <alpha-value>)',
       },
 
       fontFamily: {

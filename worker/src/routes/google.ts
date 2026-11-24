@@ -390,7 +390,9 @@ googleRoutes.post('/finalize', requireAuth, requirePolicyAcceptance, async (c) =
       authorization_failed_at: number | null;
       status: string;
     }>();
-  const cleanupPending = existing?.status === 'disconnecting';
+  if (existing?.status === 'disconnecting') {
+    return c.text('The previous Google connection is still disconnecting. After it finishes, connect Google again.', 409);
+  }
   const grantIsDead =
     !!existing && existing.sync_enabled === 0 && existing.authorization_failed_at != null;
   const differentAccount =
@@ -398,7 +400,7 @@ googleRoutes.post('/finalize', requireAuth, requirePolicyAcceptance, async (c) =
     !!existing.google_account_email &&
     !!pending.google_account_email &&
     existing.google_account_email !== pending.google_account_email;
-  const switchingFromActive = differentAccount && (cleanupPending || !grantIsDead);
+  const switchingFromActive = differentAccount && !grantIsDead;
   if (switchingFromActive) {
     // The pending grant is abandoned rather than left to expire: the user is
     // not getting this connection, so this app should not keep the credential
@@ -421,7 +423,7 @@ googleRoutes.post('/finalize', requireAuth, requirePolicyAcceptance, async (c) =
     return c.text('That connection attempt could not be completed. Please connect Google again.', 410);
   }
 
-  await storeConnection(
+  const stored = await storeConnection(
     c.env,
     c.get('userId'),
     refreshToken,
@@ -433,7 +435,9 @@ googleRoutes.post('/finalize', requireAuth, requirePolicyAcceptance, async (c) =
     Math.max(0, Math.floor(((pending.access_token_expires_at ?? 0) - Date.now()) / 1000)),
     pending.google_account_email,
     'primary',
+    pendingId,
   );
+  if (!stored) return c.text('The Google connection changed during setup. Finish disconnecting, then connect again.', 409);
   await deletePendingConnection(c.env, pendingId);
   return c.json({ connected: true });
 });

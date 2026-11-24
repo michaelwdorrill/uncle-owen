@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import type { AppEnv } from '../lib/authMiddleware';
 import { exchangeCodeForToken, fetchDiscordUser, fetchDiscordUserGuilds } from '../lib/discord';
-import { oauthCallbackAllowed } from '../lib/rateLimit';
+import { oauthCallbackAllowed, oauthRetryPage } from '../lib/rateLimit';
 import { activeAllowListedGuildIds, markLoginSucceeded, syncGuildMembership, upsertUser } from '../lib/db';
 import { signJwt, verifyJwt } from '../lib/jwt';
 import { createSession, revokeSession, rotateSession } from '../lib/sessions';
@@ -175,7 +175,8 @@ authRoutes.get('/callback', async (c) => {
   // allowance for real logins without ever paying for a valid state.
   if (!(await oauthCallbackAllowed(c.env, c.req.raw.headers))) {
     c.header('Cache-Control', NO_STORE);
-    return c.text('Too many login attempts from this address. Please wait a minute and try again.', 429);
+    c.header('Retry-After', '60');
+    return c.html(oauthRetryPage(c.env.FRONTEND_URL + '/#/login'), 429);
   }
 
   try {

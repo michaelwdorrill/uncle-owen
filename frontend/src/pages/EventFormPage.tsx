@@ -57,7 +57,9 @@ export default function EventFormPage() {
   const isEdit = !!eventId;
   const { guilds, selectedGuildId: contextGuildId } = useGuild();
 
-  const prefillDate = searchParams.get('date') ?? DateTime.now().toISODate()!;
+  const [timezone, setTimezone] = useState(user?.timezone ?? 'America/New_York');
+  const now = DateTime.now().setZone(timezone);
+  const prefillDate = searchParams.get('date') ?? (now.hour >= 19 ? now.plus({ days: 1 }) : now).toISODate()!;
 
   // Which server this event belongs to. Defaults to the ?guild= a calendar
   // day-click or "New Event" button already carries, falling back to the
@@ -73,7 +75,6 @@ export default function EventFormPage() {
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [game, setGame] = useState('');
-  const [timezone, setTimezone] = useState(user?.timezone ?? 'America/New_York');
   const [eventType, setEventType] = useState<'single' | 'poll'>('single');
 
   // Single-event fields
@@ -112,14 +113,16 @@ export default function EventFormPage() {
   // Poll fields (shared)
   const [pollStrategy, setPollStrategy] = useState<PollStrategy>('threshold');
   const [pollThreshold, setPollThreshold] = useState(3);
-  const [pollDeadline, setPollDeadline] = useState(
-    DateTime.fromISO(prefillDate).minus({ days: 1 }).toISODate()!,
-  );
+  const [chosenPollDeadline, setPollDeadline] = useState<string | null>(null);
 
   // Poll fields ('options' mode)
   const [pollSlots, setPollSlots] = useState<PollSlotDraft[]>([
     { key: crypto.randomUUID(), date: prefillDate, startTime: DEFAULT_START_TIME, endDate: prefillDate, endTime: DEFAULT_END_TIME },
   ]);
+  const earliestSlot = pollSlots.map(slot => slot.date).filter(Boolean).sort()[0] ?? prefillDate;
+  const proposedDeadline = DateTime.fromISO(earliestSlot, { zone: timezone }).minus({ days: 1 }).toISODate();
+  const today = now.toISODate()!;
+  const pollDeadline = chosenPollDeadline ?? (proposedDeadline && proposedDeadline > today ? proposedDeadline : today);
   const [multiWinner, setMultiWinner] = useState(false);
 
   // The one field that decides what the candidates above *mean* (specs/0013).

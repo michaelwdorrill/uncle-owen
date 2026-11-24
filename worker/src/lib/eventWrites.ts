@@ -1,10 +1,11 @@
 import { DateTime } from 'luxon';
 import type { Env } from '../env';
-import { chunkIds, chunkRows, conditionalRowsSql, placeholders } from './d1';
+import { chunkIds, chunkRows, conditionalRowsSql, placeholders, type SqlPredicate } from './d1';
 import { filterActiveGuildMembers } from './db';
 import type { EventRow } from './events';
 import { commonServerSet } from './groups';
 import { newId } from './ids';
+import { isSeriesOccurrence } from './recurrence';
 import {
   assertBoolean,
   assertOneOf,
@@ -776,6 +777,7 @@ export function inviteStatements(
   // a preflight count cannot cover. Only the additive path passes it; a full
   // replace is bounded by the resolved set it submits.
   totalCap: number | null = null,
+  predicate?: SqlPredicate,
 ): D1PreparedStatement[] {
   const extraGuard = mutationToken === null ? '' : ' AND mutation_token = ?';
   const extraBinds = mutationToken === null ? [] : [mutationToken];
@@ -818,10 +820,10 @@ export function inviteStatements(
         return env.DB.prepare(
           `INSERT INTO event_invites (${INVITE_COLUMNS.join(', ')})
            SELECT * FROM (${arms})
-           WHERE (SELECT COUNT(*) FROM event_invites WHERE event_id = ?) < ?
+           WHERE (SELECT COUNT(*) FROM event_invites WHERE event_id = ?) < ? ${predicate ? `AND (${predicate.sql})` : ''}
            LIMIT MAX(0, ? - (SELECT COUNT(*) FROM event_invites WHERE event_id = ?))
            ${conflict}`,
-        ).bind(...values, eventId, totalCap, totalCap, eventId);
+        ).bind(...values, eventId, totalCap, ...(predicate?.binds ?? []), totalCap, eventId);
       }
       return env.DB.prepare(
         `INSERT INTO event_invites (${INVITE_COLUMNS.join(', ')})
@@ -953,6 +955,13 @@ async function replaceInviteStatements(
 // Additive-only: for the dedicated "invite more people" endpoint (POST
 // /events/:eventId/invites), which -- unlike a full edit-form submission --
 // should never remove anyone already invited.
+/** Build the single named invitation for an accepted change request using the
+ * ordinary member-admission rules and the write-time invite ceiling. */
+export async function requestedInviteStatements(env: Env, event: EventRow, userId: string, pending: SqlPredicate) {
+  const invitees = await resolveInviteeUserIds(env, event.guild_id, [userId], [], null, event.organizer_id);
+  return inviteStatements(env, event.id, invitees, false, null, LIMITS.MAX_RESOLVED_INVITEES, pending);
+}
+
 export async function addInvitesToEvent(
   env: Env,
   eventId: string,
@@ -1203,15 +1212,24 @@ function localDateKey(ms: number, zone: string): string {
 // conditioned on, and merging the delta onto it is what lets the resulting
 // event be validated as a complete object rather than as a bag of
 // individually-valid fields.
-export async function updateEvent(
+export async function buildEventUpdate(
   env: Env,
   eventId: string,
   guildId: string,
   input: Partial<EventWriteInput>,
   stored: EventRow,
-): Promise<void> {
+  predicate?: SqlPredicate,
+) {
   input = normalizeWindowInput(input);
-  validateEventWriteInput(input);
+  const blockMinutes = input.windowBlockMinutes !== undefined ? input.windowBlockMinutes : stored.window_block_minutes;
+  validateEventWriteInput(input.pollOptions ? { ...input, windowBlockMinutes: blockMinutes } : input);
+  if (stored.event_type === 'poll' && input.windowBlockMinutes !== undefined && !input.pollOptions) {
+    const invalid = await env.DB.prepare(
+      `SELECT 1 FROM event_poll_options WHERE event_id = ? AND (end_at - start_at < ? OR end_at - start_at > ?) LIMIT 1`,
+    ).bind(eventId, (blockMinutes ?? 0) * 60_000,
+      blockMinutes == null ? LIMITS.MAX_EVENT_DURATION_MS : LIMITS.MAX_WINDOW_SPAN_MS).first();
+    if (invalid) throw new ValidationError('The existing candidates do not fit the requested session length');
+  }
   assertCoherentMergedEvent(stored, input);
   const now = Date.now();
   const wasRecurring = !!stored.is_recurring;
@@ -1292,6 +1310,17 @@ export async function updateEvent(
   // realises a session is more private than they thought must be able to take
   // it off the noticeboard, and hiding something is exactly the direction that
   // should never require deleting and recreating it.
+  if (!input.pollOptions) {
+    for (const [column, value] of [
+      ['poll_strategy', input.pollStrategy], ['poll_threshold_count', input.pollThresholdCount],
+      ['poll_deadline_at', input.pollDeadlineAt], ['poll_resolution_mode', input.pollResolutionMode],
+    ] as const) {
+      if (value !== undefined) {
+        setClauses.push(column + ' = ?');
+        values.push(value);
+      }
+    }
+  }
   if (input.isPrivate !== undefined) {
     setClauses.push('is_private = ?');
     values.push(input.isPrivate ? 1 : 0);
@@ -1397,6 +1426,12 @@ export async function updateEvent(
   const mergedPollStrategy = input.pollStrategy !== undefined ? input.pollStrategy : stored.poll_strategy;
   const mergedThresholdCount =
     input.pollThresholdCount !== undefined ? input.pollThresholdCount : stored.poll_threshold_count;
+  if (mergedPollStrategy === 'threshold' && mergedThresholdCount == null) {
+    throw new ValidationError('pollThresholdCount is required when pollStrategy is threshold');
+  }
+  if (stored.event_type === 'poll' && input.pollDeadlineAt === null) {
+    throw new ValidationError('pollDeadlineAt is required for a poll');
+  }
   if (mergedPollStrategy === 'threshold' && mergedThresholdCount != null) {
     const inviteeCount =
       invitees !== null
@@ -1412,8 +1447,8 @@ export async function updateEvent(
   const statements: D1PreparedStatement[] = [
     env.DB.prepare(
       `UPDATE events SET ${setClauses.join(', ')}, revision = revision + 1, mutation_token = ?
-       WHERE id = ? AND revision = ?${quotaGuardSql}`,
-    ).bind(...values.slice(0, -1), mutationToken, values[values.length - 1], storedRevision, ...quotaGuardParams),
+       WHERE id = ? AND revision = ?${quotaGuardSql} ${predicate ? `AND (${predicate.sql})` : ''}`,
+    ).bind(...values.slice(0, -1), mutationToken, values[values.length - 1], storedRevision, ...quotaGuardParams, ...(predicate?.binds ?? [])),
   ];
 
   // Every sibling statement below is conditioned on this request's own main
@@ -1437,7 +1472,21 @@ export async function updateEvent(
   const guardedStatement = (sql: string, ...binds: unknown[]): D1PreparedStatement =>
     env.DB.prepare(`${sql}${siblingGuard}`).bind(...binds, ...guardBinds);
 
-  if (clearsAttendanceOnDateMove) {
+  if (convertingToRecurring && input.recurrence) {
+    // Answers belong to the date the invitee saw. Discard any obsolete keys
+    // from an earlier series before moving a matching one-off answer.
+    statements.push(guardedStatement(`DELETE FROM event_attendance WHERE event_id = ? AND occurrence_date != ''`, eventId));
+    const originalDate = stored.start_at == null ? null : localDateKey(stored.start_at, stored.timezone);
+    const rule = { ...input.recurrence, byWeekday: input.recurrence.byWeekday?.join(',') ?? null };
+    if (originalDate === rule.startDate && isSeriesOccurrence(rule, input.timezone ?? stored.timezone, originalDate)) {
+      statements.push(guardedStatement(
+        `UPDATE event_attendance SET occurrence_date = ? WHERE event_id = ? AND occurrence_date = ''`,
+        originalDate, eventId,
+      ));
+    } else {
+      statements.push(guardedStatement(`DELETE FROM event_attendance WHERE event_id = ? AND occurrence_date = ''`, eventId));
+    }
+  } else if (clearsAttendanceOnDateMove) {
     statements.push(
       guardedStatement(`DELETE FROM event_attendance WHERE event_id = ? AND occurrence_date = ''`, eventId),
     );
@@ -1642,6 +1691,17 @@ export async function updateEvent(
   // wrong in different ways (unguarded siblings, then siblings guarded on
   // state a concurrent request could establish). If a new sibling statement
   // is added above, it needs the same guard.
+  return { statements, mutationToken, storedRevision, convertingToRecurring };
+}
+
+export async function updateEvent(
+  env: Env,
+  eventId: string,
+  guildId: string,
+  input: Partial<EventWriteInput>,
+  stored: EventRow,
+): Promise<void> {
+  const { statements, storedRevision, convertingToRecurring } = await buildEventUpdate(env, eventId, guildId, input, stored);
   const results = await env.DB.batch(statements);
   if (results[0].meta.changes > 0) return;
 

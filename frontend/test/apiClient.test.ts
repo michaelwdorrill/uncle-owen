@@ -31,6 +31,12 @@ beforeEach(() => {
   vi.resetModules();
   storage = new MemoryStorage();
   vi.stubGlobal('localStorage', storage);
+  let turn = Promise.resolve();
+  vi.stubGlobal('navigator', { locks: { request: <T>(_name: string, work: () => T) => {
+    const result = turn.then(work);
+    turn = result.then(() => undefined, () => undefined);
+    return result;
+  } } });
   vi.stubGlobal('window', { location: { hash: '' } });
 });
 
@@ -61,7 +67,7 @@ describe('a refresh that lands after logout is discarded (P12-05)', () => {
           // the request has been sent and its response has not arrived. Doing
           // it any earlier just means the refresh never starts, which is not
           // the race this is about.
-          clearToken();
+          await clearToken();
           return new Response(JSON.stringify({ token: 'successor-token' }), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
@@ -138,7 +144,7 @@ describe('a discarded stale refresh does not log out the new account (P13-06)', 
         if (url.includes('/auth/refresh')) {
           // While account A's refresh is in flight, the user signs in as
           // account B -- a real identity change, not a logout.
-          adoptSession('account-b-token');
+          await adoptSession('account-b-token');
           return new Response(JSON.stringify({ token: 'account-a-successor' }), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
@@ -173,7 +179,7 @@ describe('a refresh in another tab cannot replace a newly adopted account (P14-0
     vi.resetModules();
     const tabTwoStorage = await import('../src/auth/tokenStorage');
 
-    tabOneStorage.adoptSession('alice-token');
+    await tabOneStorage.adoptSession('alice-token');
 
     vi.stubGlobal(
       'fetch',
@@ -181,7 +187,7 @@ describe('a refresh in another tab cannot replace a newly adopted account (P14-0
         const url = String(input);
         if (url.includes('/auth/refresh')) {
           // The *other* tab signs in as Bob while Alice's refresh is away.
-          tabTwoStorage.adoptSession('bob-token');
+          await tabTwoStorage.adoptSession('bob-token');
           return new Response(JSON.stringify({ token: 'alice-successor' }), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
@@ -204,7 +210,7 @@ describe('a refresh in another tab cannot replace a newly adopted account (P14-0
     const tabOne = await import('../src/api/client');
     const tabOneStorage = await import('../src/auth/tokenStorage');
 
-    tabOneStorage.adoptSession('shared-token');
+    await tabOneStorage.adoptSession('shared-token');
 
     let call = 0;
     vi.stubGlobal(
@@ -243,7 +249,7 @@ describe('an obsolete retry does not log out the current account (P14-04)', () =
     const { api } = await import('../src/api/client');
     const { adoptSession } = await import('../src/auth/tokenStorage');
 
-    adoptSession('alice-token');
+    await adoptSession('alice-token');
 
     let dataCalls = 0;
     vi.stubGlobal(
@@ -260,7 +266,7 @@ describe('an obsolete retry does not log out the current account (P14-04)', () =
         if (dataCalls === 1) return new Response('', { status: 401 });
         // The retry. Alice's session has ended and Bob has signed in while it
         // was in flight, so this 401 is correct -- and must not be acted on.
-        adoptSession('bob-token');
+        await adoptSession('bob-token');
         return new Response('', { status: 401 });
       }),
     );
@@ -310,7 +316,7 @@ describe('a full storage area does not disable the identity guard (P15-02)', () 
       realSet(k, v);
     };
 
-    adoptSession('alice-token-2');
+    await adoptSession('alice-token-2');
     expect(storage.getItem('jps_identity'), 'the fixture did not model a full storage area').toBeNull();
 
     // The retry after refreshing has to SUCCEED, or the client bounces to
@@ -325,7 +331,7 @@ describe('a full storage area does not disable the identity guard (P15-02)', () 
         const url = String(input);
         if (url.includes('/auth/refresh')) {
           // The user hits Log out with the refresh genuinely in flight.
-          clearToken();
+          await clearToken();
           return new Response(JSON.stringify({ token: 'alice-successor' }), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
@@ -348,4 +354,17 @@ describe('a full storage area does not disable the identity guard (P15-02)', () 
       'a live token was put back for an account the user had logged out of, because a full storage area left the guard reading null on both sides',
     ).toBeNull();
   });
+});
+
+it('keeps refreshing in this tab when an identity cannot be published to shared storage', async () => {
+  const { adoptSession, getToken, authEpoch, refreshSession } = await import('../src/auth/tokenStorage');
+  const write = storage.setItem.bind(storage);
+  storage.setItem = (key, value) => {
+    if (key === 'jps_identity') throw new DOMException('QuotaExceededError');
+    write(key, value);
+  };
+  await adoptSession('local-account');
+  expect(await refreshSession(authEpoch(), 'local-successor')).toBe(true);
+  expect(getToken()).toBe('local-successor');
+  expect(storage.getItem(TOKEN_KEY)).toBeNull();
 });

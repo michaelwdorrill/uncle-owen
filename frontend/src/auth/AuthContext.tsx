@@ -78,7 +78,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // A login is a new identity, so it moves the auth epoch -- that is what
       // lets an in-flight refresh for the previous account recognise itself as
       // obsolete instead of overwriting this one (P12-05 / P13-06).
-      adoptSession(token);
+      await adoptSession(token);
       setLoading(true);
       await refreshUser();
     },
@@ -86,10 +86,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const logout = useCallback(async () => {
-    const token = getToken();
     // Clear the local session first so the UI responds immediately and can't
     // be left half-logged-in by a hanging request.
-    clearToken();
+    const { token } = await clearToken();
     setUser(null);
     setError(null);
     if (!token) return { confirmed: true, queued: false };

@@ -21,7 +21,7 @@
 
 import type { Env } from '../env';
 import { buildCalendarOccurrences } from '../lib/calendar';
-import { chunkRows, placeholders } from '../lib/d1';
+import { chunkRows } from '../lib/d1';
 import {
   accessTokenFor,
   deleteCalendarEvent,
@@ -31,6 +31,8 @@ import {
   patchCalendarEvent,
   listCalendarEvents,
   readRefreshToken,
+  readPendingRefreshToken,
+  type PendingConnectionRow,
   revokeToken,
 } from '../lib/googleCalendar';
 import { newId } from '../lib/ids';
@@ -97,23 +99,9 @@ export const SYNC_INTERVAL_MS = 55 * 60 * 1000;
 // can reach; importing less would leave a gap inside a range they can.
 export const BUSY_CACHE_WINDOW_MS = 62 * 24 * 60 * 60 * 1000;
 
-// A ceiling on how many of the chosen calendar's events get imported per
-// sync.
-//
-// This is a much smaller number than the JSON-blob cache this replaced ever
-// needed (that one merged overlapping events into far fewer intervals; this
-// keeps one row per event). It exists for two reasons at once: a pathological
-// calendar cannot make one sync's D1 batch unbounded, and each import becomes
-// a real, visible personal_events row -- someone genuinely logging every
-// meeting from a work calendar is a heavier use of this feature than a
-// friend-group scheduler's availability check was sized for, and a hard cap
-// is the honest way to say so rather than quietly falling over. Exceeding it
-// keeps the EARLIEST events, since the assistant is overwhelmingly used for
-// the near term.
-//
-// Sized together with the chunking below: cron/budget.ts's
-// tryPersonalEventImport reserves for the exact worst case this produces,
-// and the two have to move together if either changes.
+// Import one page per turn. The saved cursor continues on the next sync
+// tick until the calendar window is complete. tryPersonalEventImport reserves
+// the D1 budget for one page of upserts and its checkpoint.
 const MAX_IMPORTED_EVENTS_PER_SYNC = 40;
 
 // How many bound parameters one imported row costs in the upsert statement
@@ -483,6 +471,13 @@ async function runDisconnect(
        AND EXISTS (SELECT 1 FROM google_calendar_connections
                    WHERE user_id = ? AND refresh_token_ciphertext = ?)`,
     ).bind(row.user_id, row.user_id, row.refresh_token_ciphertext),
+    // A pending grant minted before this revocation cannot safely be
+    // finalized afterwards. Keep pending grants for other known accounts.
+    env.DB.prepare(
+      `DELETE FROM google_pending_connections WHERE user_id = ?
+       AND (? IS NULL OR google_account_email IS NULL OR LOWER(google_account_email) = LOWER(?))
+       AND EXISTS (SELECT 1 FROM google_calendar_connections WHERE user_id = ? AND refresh_token_ciphertext = ?)`,
+    ).bind(row.user_id, row.google_account_email, row.google_account_email, row.user_id, row.refresh_token_ciphertext),
     env.DB.prepare(
       `DELETE FROM google_calendar_connections WHERE user_id = ? AND refresh_token_ciphertext = ?`,
     ).bind(row.user_id, row.refresh_token_ciphertext),
@@ -595,6 +590,7 @@ async function syncOneConnection(
     firstFailure ??= message;
   };
 
+  let cleanupReserved = false;
   for (const occ of desired) {
     const key = `${occ.eventId}::${occ.occurrenceDate}`;
     const existing = linkByKey.get(key);
@@ -736,44 +732,43 @@ async function syncOneConnection(
       continue;
     }
 
-    if (!budget.tryCalendarWrite()) {
+    // Reserve one D1 statement for recording a refused mapping. One is
+    // enough for the whole connection: a refusal ends this stale sync.
+    if (!cleanupReserved) cleanupReserved = budget.trySpend(1);
+    if (!cleanupReserved || !budget.tryCalendarWrite()) {
       outOfBudget = true;
       break;
     }
-    const result = await insertCalendarEvent(accessToken, row.calendar_id, payload);
+    const result = await insertCalendarEvent(accessToken, row.calendar_id, payload, row.user_id, () => budget.tryCalendarWrite());
     if (result.ok) {
-      // Pass-20 review (P20-04). Everything from here to the mapping write is
-      // the window in which Google has ALREADY created the event and nothing
-      // local knows it. The Pass-19 compensation handled the mapping returning
-      // zero changes; it did not handle the mapping THROWING, because the
-      // throw left the function before either the compensating delete or the
-      // obligation record could run. The event stayed in the calendar with no
-      // record anywhere, the next sweep made a second copy, and disconnect
-      // could reach only the second.
-      //
-      // `owe()` is the smallest thing that closes the exception schedule: a
-      // best-effort obligation, written in its own try because the database is
-      // by hypothesis unhealthy at this point. Being honest about its limit
-      // matters more than the fix -- this covers a failed statement, NOT a
-      // process interruption between Google's 200 and any local write at all.
-      // Closing that needs idempotent creation with a client-supplied event id,
-      // which is a real design and is IDEAS item 85, not something to improvise
-      // here.
-      const owe = async (): Promise<void> => {
+      // A retry after interruption recovers the deterministic Google ID.
+      // If the destination has changed or D1 rejects the mapping, retain
+      // a cleanup obligation for the account that created the remote entry.
+      // A concurrent sync can recover the same remote ID using the new
+      // credential before this older attempt reaches its mapping write.
+      const alreadyMapped = `SELECT 1 FROM google_event_links l
+        JOIN google_calendar_connections c ON c.user_id = l.user_id
+        WHERE l.user_id = ? AND l.calendar_id = ? AND l.google_event_id = ?
+          AND LOWER(c.google_account_email) = LOWER(?)`;
+      const mappedBinds = [row.user_id, row.calendar_id, result.value.id, row.google_account_email];
+      const owe = async (): Promise<string | null> => {
         try {
-          await env.DB.prepare(
+          const id = newId();
+          const recorded = await env.DB.prepare(
             `INSERT INTO google_orphaned_inserts
                (id, user_id, google_event_id, calendar_id, created_at, google_account_email)
-             VALUES (?, ?, ?, ?, ?, ?)
+             SELECT ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (${alreadyMapped})
              ON CONFLICT(user_id, calendar_id, google_event_id) DO NOTHING`,
           )
-            .bind(newId(), row.user_id, result.value.id, row.calendar_id, now, row.google_account_email)
+            .bind(id, row.user_id, result.value.id, row.calendar_id, now, row.google_account_email, ...mappedBinds)
             .run();
+          return recorded.meta.changes ? id : null;
         } catch (err) {
           console.error(
             `Google sync for ${row.user_id}: created ${result.value.id} in Google and could not record the obligation to remove it`,
             err,
           );
+          return null;
         }
       };
 
@@ -836,29 +831,15 @@ async function syncOneConnection(
         throw err;
       }
 
-      // Pass-19 review (P19-08). The guard above refuses the mapping when the
-      // destination or credential moved while this insert was in flight -- and
-      // until now, that was the end of it. The event existed in the user's
-      // Google calendar and nothing local pointed at it, so the next sweep
-      // made a second copy, and DISCONNECT could not remove the first, because
-      // disconnect enumerates google_event_links. Three places in the product
-      // promise, without qualification, that disconnecting removes the
-      // upcoming entries this app added.
-      //
-      // So a refused mapping is now an obligation rather than a shrug. Try to
-      // undo the remote insert straight away, which also removes the duplicate
-      // that made this visible; if that cannot happen -- the delete fails, or
-      // the calendar-write allowance is spent -- record it so cleanup can.
-      //
-      // Note the delete targets `row.calendar_id`, the calendar this insert
-      // was actually dispatched to, not wherever the connection points now.
-      // That is the same lesson P13-08 taught the disconnect sweep.
       if (mapping.meta.changes === 0) {
-        const compensated =
-          budget.tryCalendarWrite() &&
-          (await deleteCalendarEvent(accessToken, row.calendar_id, result.value.id)).ok;
-        if (!compensated) await owe();
-        continue;
+        // Persist the obligation before cleanup. A concurrent mapping for
+        // this ID suppresses it and preserves the other sync's event.
+        const obligation = await owe();
+        if (obligation && budget.tryCalendarWrite()) {
+          const removed = await deleteCalendarEvent(accessToken, row.calendar_id, result.value.id);
+          if (removed.ok) await env.DB.prepare('DELETE FROM google_orphaned_inserts WHERE id = ?').bind(obligation).run();
+        }
+        return;
       }
 
       counts.inserted += 1;
@@ -984,14 +965,14 @@ async function syncOneConnection(
   await syncImportedPersonalEvents(env, row, accessToken, budget, now, pushedGoogleEventIds);
 }
 
-// One statement per upsert chunk, plus this one DELETE -- computed once from
+// One statement per upsert chunk, one prune and one cursor update, computed from
 // the same two constants tryPersonalEventImport is reserved against, so the
 // two can never silently drift apart.
 const MAX_UPSERT_STATEMENTS = chunkRows(
   new Array<null>(MAX_IMPORTED_EVENTS_PER_SYNC).fill(null),
-  IMPORT_PARAMS_PER_ROW,
+  IMPORT_PARAMS_PER_ROW, 6,
 ).length;
-const MAX_IMPORT_STATEMENTS = MAX_UPSERT_STATEMENTS + 1;
+const MAX_IMPORT_STATEMENTS = MAX_UPSERT_STATEMENTS + 2;
 
 // The pull half: one events.list call against the ONE calendar this person
 // chose, reconciled into that person's own personal_events rows. Every event
@@ -1028,9 +1009,21 @@ async function syncImportedPersonalEvents(
   // assume regardless of how many events the calendar actually has.
   if (!budget.tryPersonalEventImport(MAX_IMPORT_STATEMENTS)) return;
 
-  const result = await listCalendarEvents(accessToken, row.read_calendar_id, now, now + BUSY_CACHE_WINDOW_MS);
+  const pageToken = row.import_page_token ?? null;
+  const from = pageToken ? row.import_window_start ?? now : now;
+  const runId = pageToken && row.import_run_id ? row.import_run_id : newId();
+  const result = await listCalendarEvents(accessToken, row.read_calendar_id, from, from + BUSY_CACHE_WINDOW_MS, pageToken, MAX_IMPORTED_EVENTS_PER_SYNC);
+  const current = `user_id = ? AND status = 'active' AND sync_enabled = 1 AND read_calendar_id = ?
+    AND refresh_token_ciphertext = ? AND import_run_id IS ? AND import_page_token IS ?`;
+  const guardBinds = [row.user_id, row.read_calendar_id, row.refresh_token_ciphertext, row.import_run_id ?? null, pageToken];
+  const stillCurrent = `EXISTS (SELECT 1 FROM google_calendar_connections WHERE ${current})`;
 
   if (!result.ok) {
+    if (pageToken && (result.status === 400 || result.status === 410)) {
+      await env.DB.prepare(`UPDATE google_calendar_connections SET import_run_id = ?, import_page_token = NULL,
+        import_window_start = NULL WHERE ${current}`).bind(newId(), ...guardBinds).run();
+      return;
+    }
     if (result.kind === 'unauthorized') {
       await markUnauthorized(env, row, UNAUTHORIZED_ERROR);
       return;
@@ -1092,100 +1085,16 @@ async function syncImportedPersonalEvents(
     return;
   }
 
-  const { timeZone, events, hasMore } = result.value;
+  const { timeZone, events, nextPageToken } = result.value;
   const candidates = events
     .filter((e) => !pushedGoogleEventIds.has(e.googleEventId))
     .sort((a, b) => a.startAt - b.startAt);
   const imported = candidates.slice(0, MAX_IMPORTED_EVENTS_PER_SYNC);
 
-  // Pass-11 review (R16). Forty-one events over two months is ordinary
-  // calendar usage, not a pathological case, and everything past the cap used
-  // to be dropped with nothing recorded anywhere: no error, no flag, and
-  // last_error left null. The omitted meetings simply never became busy
-  // blocks, so the scheduling assistant reported those times as free -- the
-  // failure mode where incomplete data is presented as complete.
-  //
-  // Properly paging this needs a per-connection cursor and a migration, which
-  // is deliberately not smuggled in here. What is fixed is the part that
-  // actively misleads: the truncation is now visible to its owner, and the
-  // reconciliation below stops deleting on the strength of an answer it knows
-  // to be partial.
-  const truncated = candidates.length > MAX_IMPORTED_EVENTS_PER_SYNC || hasMore;
-
-  const statements = [];
-
-  // Pass-11 review (R10). Everything below is conditioned on the connection
-  // still being the one this sync started against.
-  //
-  // The race is ordinary, not exotic: this function snapshots the connection,
-  // awaits listCalendarEvents over the network, and then writes. If the person
-  // switches reading off (PATCH /google `readCalendarId: null`) or picks a
-  // different calendar while that call is in flight, PATCH correctly deletes
-  // the imports and clears the preference -- and then this sweep, holding a
-  // snapshot from before, writes them all back. The next sweep returns
-  // immediately for a null read calendar, so nothing ever cleans up after it:
-  // titles and descriptions from a calendar the person stopped sharing sit
-  // there indefinitely, still counted as busy against them.
-  //
-  // Re-reading the row before the batch would not fix it -- there is still a
-  // gap between that read and the write. The guard has to be inside the
-  // statements, where D1's batch transaction makes it atomic with them.
-  //
-  // Pass-15 review (P15-04). `refresh_token_ciphertext` is part of the guard
-  // for the same reason it is part of the push half's (P14-06): the calendar
-  // string alone does not identify a source. Two Google accounts both have a
-  // `primary`, and one shared calendar can legitimately be selected by either
-  // -- so without the credential, an import fetched under the account the user
-  // just left lands in the account they just connected, and its titles sit
-  // there as that person's busy time.
-  const stillCurrent = `EXISTS (SELECT 1 FROM google_calendar_connections
-       WHERE user_id = ? AND status = 'active' AND sync_enabled = 1 AND read_calendar_id = ?
-         AND refresh_token_ciphertext = ?)`;
-  const guardBinds = [row.user_id, row.read_calendar_id, row.refresh_token_ciphertext];
-
-  // Anything previously imported that fell inside this window and did not
-  // come back this time -- deleted, cancelled, or moved outside the window
-  // by being rescheduled. Bounded to the window itself: a past occurrence
-  // this sync isn't even asking about is left alone rather than reasoned
-  // about from its absence in an answer that was never about it.
-  //
-  // Skipped entirely when the source answer was truncated (R16): rows missing
-  // from a partial response are not evidence of anything, and deleting on
-  // that basis would churn genuinely-current entries out of the database
-  // every tick.
-  if (!truncated) {
-    const currentIds = imported.map((e) => e.googleEventId);
-    // Pass-11 review (R19): the same overlap predicate the source query uses,
-    // not `start_at >= now`. Google's timeMin bounds an event's *end*, so an
-    // event that started yesterday and ends tomorrow is inside the range this
-    // sync asked about -- but the old predicate could never match it, so
-    // deleting or cancelling an in-progress event in Google never removed the
-    // app's copy. Its busy time stayed blocked and its title and description
-    // stayed imported, permanently, with the local delete route refusing to
-    // touch it (409) because it came from Google.
-    const overlapsWindow = `end_at > ? AND start_at < ?`;
-    const staleSql =
-      currentIds.length > 0
-        ? `DELETE FROM personal_events
-           WHERE user_id = ? AND google_event_id IS NOT NULL
-             AND ${overlapsWindow}
-             AND google_event_id NOT IN (${placeholders(currentIds.length)})
-             AND ${stillCurrent}`
-        : `DELETE FROM personal_events
-           WHERE user_id = ? AND google_event_id IS NOT NULL
-             AND ${overlapsWindow}
-             AND ${stillCurrent}`;
-    statements.push(
-      env.DB.prepare(staleSql).bind(row.user_id, now, now + BUSY_CACHE_WINDOW_MS, ...currentIds, ...guardBinds),
-    );
-  }
-
-  // status/availability/is_recurring are written as literals, not bound --
-  // every imported row is active, counts as busy (per the decision above),
-  // and is never itself a recurring series: Google's own singleEvents=true
-  // already expanded any recurring source event into individual instances,
-  // each with its own googleEventId, before this ever saw it.
-  for (const chunk of chunkRows(imported, IMPORT_PARAMS_PER_ROW)) {
+  // Never prune on an incomplete or oversized provider response.
+  const oversized = candidates.length > MAX_IMPORTED_EVENTS_PER_SYNC;
+  const statements: D1PreparedStatement[] = [];
+  for (const chunk of chunkRows(imported, IMPORT_PARAMS_PER_ROW, guardBinds.length + 1)) {
     // `SELECT ... WHERE EXISTS` rather than `VALUES`, so the same guard the
     // DELETE carries applies to the rows being written too -- a VALUES clause
     // has nowhere to put a condition. Literals stay literal in the first arm's
@@ -1216,46 +1125,32 @@ async function syncImportedPersonalEvents(
       env.DB.prepare(
         `INSERT INTO personal_events
            (id, user_id, title, description, timezone, start_at, end_at, status, availability, is_recurring,
-            google_event_id, created_at, updated_at)
-         SELECT * FROM (${arms})
+            google_event_id, created_at, updated_at, google_seen_run)
+         SELECT page.*, ? FROM (${arms}) AS page
          WHERE ${stillCurrent}
          ON CONFLICT(user_id, google_event_id) DO UPDATE SET
            title = excluded.title, description = excluded.description, timezone = excluded.timezone,
-           start_at = excluded.start_at, end_at = excluded.end_at, updated_at = excluded.updated_at`,
-      ).bind(...params, ...guardBinds),
+           start_at = excluded.start_at, end_at = excluded.end_at, updated_at = excluded.updated_at, google_seen_run = excluded.google_seen_run`,
+      ).bind(runId, ...params, ...guardBinds),
     );
   }
 
-  // Said in last_error because that is the field Settings actually shows, and
-  // "some of your calendar is missing from this" is exactly the kind of thing
-  // its owner has to be able to see. Cleared on a complete import, so it does
-  // not outlive the condition -- and deliberately not phrased as a failure,
-  // because nothing failed: the import is working and is incomplete, which is
-  // a different sentence.
-  const truncationNotice = truncated
-    ? `Only the first ${MAX_IMPORTED_EVENTS_PER_SYNC} events from this calendar are being read, so times beyond ` +
-      'them will not show as busy.'
-    : null;
-  statements.push(
-    env.DB.prepare(
-      // P15-04 again: a note about what one account's calendar contained must
-      // not be stamped on another account's connection.
-      `UPDATE google_calendar_connections SET updated_at = ?, last_error = COALESCE(?, last_error)
-       WHERE user_id = ? AND read_calendar_id = ? AND refresh_token_ciphertext = ?`,
-    ).bind(now, truncationNotice, row.user_id, row.read_calendar_id, row.refresh_token_ciphertext),
-  );
-
+  if (!nextPageToken && !oversized) {
+    statements.push(env.DB.prepare(`DELETE FROM personal_events WHERE user_id = ? AND google_event_id IS NOT NULL
+      AND end_at > ? AND start_at < ? AND google_seen_run IS NOT ? AND ${stillCurrent}`)
+      .bind(row.user_id, from, from + BUSY_CACHE_WINDOW_MS, runId, ...guardBinds));
+  }
+  const notice = oversized ? `Only the first ${MAX_IMPORTED_EVENTS_PER_SYNC} events were accepted from an oversized Google page.`
+    : nextPageToken ? 'More events are being imported from this calendar.' : null;
+  statements.push(env.DB.prepare(`UPDATE google_calendar_connections SET import_run_id = ?, import_page_token = ?,
+    import_window_start = ?, updated_at = ?, last_error = COALESCE(?, last_error) WHERE ${current}`)
+    .bind(runId, oversized ? null : nextPageToken, nextPageToken && !oversized ? from : null, now, notice, ...guardBinds));
   await env.DB.batch(statements);
 
   if (imported.length > 0) {
     console.log(`Google personal-time import for ${row.user_id}: ${imported.length} event(s) over the next 62 days.`);
   }
-  if (truncated) {
-    console.warn(
-      `Google personal-time import for ${row.user_id} was truncated at ${MAX_IMPORTED_EVENTS_PER_SYNC} events; ` +
-        'the rest of the window is not represented as busy.',
-    );
-  }
+  if (notice) console.log(`Google import for ${row.user_id}: ${notice}`);
 }
 
 // Whether any connection is due this tick, answered before the tick's budget
@@ -1269,6 +1164,45 @@ async function syncImportedPersonalEvents(
 // Uncharged, like every other discovery read in this codebase, and it costs
 // literally nothing on a deployment with Google switched off: isGoogleConfigured
 // short-circuits before the query.
+// Revoke at most one abandoned grant per invocation. Google revokes an
+// entire account's grant, so another connection or unexpired authorization
+// for the same account must keep it. Unknown account identities are treated
+// conservatively. A lease serializes the remote call with finalization.
+async function cleanExpiredGrant(env: Env, budget: TickBudget): Promise<void> {
+  const now = Date.now();
+  const pending = await env.DB.prepare(`SELECT * FROM google_pending_connections
+    WHERE expires_at <= ? AND revoke_after <= ? ORDER BY expires_at, id LIMIT 1`).bind(now, now).first<PendingConnectionRow>();
+  if (!pending || !budget.trySpend(2) || !budget.tryCalendarWrite()) return;
+  const email = pending.google_account_email;
+  const protectedGrant = `EXISTS (SELECT 1 FROM google_calendar_connections c WHERE
+    c.google_account_email IS NULL OR ? IS NULL OR LOWER(c.google_account_email) = LOWER(?))
+    OR EXISTS (SELECT 1 FROM google_pending_connections p WHERE p.expires_at > ?
+       AND (p.google_account_email IS NULL OR ? IS NULL OR LOWER(p.google_account_email) = LOWER(?)))`;
+  const binds = [email, email, now, email, email];
+  const lease = newId();
+  const [removed, claimed] = await env.DB.batch([
+    env.DB.prepare(`DELETE FROM google_pending_connections WHERE id = ? AND revoke_after <= ? AND (${protectedGrant})`)
+      .bind(pending.id, now, ...binds),
+    env.DB.prepare(`UPDATE google_pending_connections SET revoke_lease = ?, revoke_after = ?
+      WHERE id = ? AND revoke_after <= ? AND NOT (${protectedGrant})`)
+      .bind(lease, now + 5 * 60_000, pending.id, now, ...binds),
+  ]);
+  if (removed.meta.changes || !claimed.meta.changes) return;
+  const token = await readPendingRefreshToken(env, pending);
+  if (token && await revokeToken(token)) {
+    // An authorization parked while the network call was in flight may have
+    // been covered by the same remote revocation. Require a fresh consent.
+    await env.DB.prepare(`DELETE FROM google_pending_connections WHERE (id = ? OR
+      (created_at >= ? AND (LOWER(google_account_email) = LOWER(?) OR
+       (user_id = ? AND (google_account_email IS NULL OR ? IS NULL)))))
+      AND EXISTS (SELECT 1 FROM google_pending_connections owner WHERE owner.id = ? AND owner.revoke_lease = ?)`)
+      .bind(pending.id, now, email, pending.user_id, email, pending.id, lease).run();
+  } else {
+    await env.DB.prepare(`UPDATE google_pending_connections SET revoke_lease = NULL, revoke_after = ?
+      WHERE id = ? AND revoke_lease = ?`).bind(now + 60 * 60_000, pending.id, lease).run();
+  }
+}
+
 export async function googleSyncDue(env: Env): Promise<boolean> {
   if (!isGoogleConfigured(env)) return false;
   const row = await env.DB.prepare(
@@ -1282,10 +1216,10 @@ export async function googleSyncDue(env: Env): Promise<boolean> {
      WHERE c.status = 'disconnecting'
         OR (c.sync_enabled = 1 AND c.status = 'active'
             AND u.accepted_policy_version >= ?
-            AND (c.last_synced_at IS NULL OR c.last_synced_at < ?))
-     LIMIT 1`,
+            AND (c.import_page_token IS NOT NULL OR c.last_synced_at IS NULL OR c.last_synced_at < ?))
+     UNION ALL SELECT 1 FROM google_pending_connections WHERE expires_at <= ? AND revoke_after <= ? LIMIT 1`,
   )
-    .bind(CURRENT_POLICY_VERSION, Date.now() - SYNC_INTERVAL_MS)
+    .bind(CURRENT_POLICY_VERSION, Date.now() - SYNC_INTERVAL_MS, Date.now(), Date.now())
     .first();
   return row != null;
 }
@@ -1319,13 +1253,14 @@ export async function sweepGoogleCalendar(env: Env, budget: TickBudget): Promise
   // declines a new policy must still be able to withdraw, and a disconnect
   // that stalled waiting for acceptance would trap the very people most likely
   // to want it. Withdrawal is not processing.
+  await cleanExpiredGrant(env, budget);
   const { results: connections } = await env.DB.prepare(
     `SELECT c.* FROM google_calendar_connections c
      JOIN users u ON u.id = c.user_id
      WHERE c.status = 'disconnecting'
         OR (c.sync_enabled = 1 AND c.status = 'active'
             AND u.accepted_policy_version >= ?
-            AND (c.last_synced_at IS NULL OR c.last_synced_at < ?))
+            AND (c.import_page_token IS NOT NULL OR c.last_synced_at IS NULL OR c.last_synced_at < ?))
      ORDER BY c.status DESC, c.last_synced_at ASC
      LIMIT ?`,
   )

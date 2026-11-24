@@ -3,7 +3,7 @@ import type { EventRow } from '../src/lib/events';
 import { buildNoticeboard } from '../src/lib/noticeboard';
 import { checkThresholdAndResolve, resolvePastDeadlinePolls } from '../src/lib/polls';
 import type { ShimDatabase } from './d1shim';
-import { seedEvent, seedGuild, seedMembership, seedUser, setup } from './helpers';
+import { seedEvent, seedGuild, seedMembership, seedInvite, seedUser, setup } from './helpers';
 
 // Pass 19 review. P19-01 is the third regression in three passes from the same
 // place, and the third of the same SHAPE: a fixed page of candidate rows cut
@@ -282,6 +282,7 @@ describe('a poll must not resolve to a candidate that was just removed (P19-02)'
     await seedUser(db, 'voter');
     await seedMembership(db, 'voter', 'guild-1');
     await seedThresholdPoll(db);
+    await seedInvite(db, 'poll-1', 'voter');
 
     // The stale read: what a vote handler is holding when it calls the
     // resolver, taken before the organizer's edit commits.
@@ -319,6 +320,7 @@ describe('a poll must not resolve to a candidate that was just removed (P19-02)'
     await seedUser(db, 'voter');
     await seedMembership(db, 'voter', 'guild-1');
     await seedThresholdPoll(db);
+    await seedInvite(db, 'poll-1', 'voter');
 
     const event = await db.prepare(`SELECT * FROM events WHERE id = 'poll-1'`).first<EventRow>();
     await db
@@ -344,6 +346,7 @@ describe('a poll must not resolve to a candidate that was just removed (P19-02)'
     await seedUser(db, 'voter');
     await seedMembership(db, 'voter', 'guild-1');
     await seedThresholdPoll(db);
+    await seedInvite(db, 'poll-1', 'voter');
 
     const staleEvent = await db.prepare(`SELECT * FROM events WHERE id = 'poll-1'`).first<EventRow>();
     await db
@@ -529,6 +532,7 @@ describe('every poll decision honours an edit that beat it (P20-02)', () => {
     await seedUser(db, 'voter');
     await seedMembership(db, 'voter', 'guild-1');
     await seedMultiWinnerPoll(db);
+    await seedInvite(db, 'poll-1', 'voter');
 
     const staleEvent = await db.prepare(`SELECT * FROM events WHERE id = 'poll-1'`).first<EventRow>();
     await db.prepare(
@@ -552,6 +556,7 @@ describe('every poll decision honours an edit that beat it (P20-02)', () => {
     await seedUser(db, 'voter');
     await seedMembership(db, 'voter', 'guild-1');
     await seedMultiWinnerPoll(db);
+    await seedInvite(db, 'poll-1', 'voter');
 
     const event = await db.prepare(`SELECT * FROM events WHERE id = 'poll-1'`).first<EventRow>();
     await db.prepare(

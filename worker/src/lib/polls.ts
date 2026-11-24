@@ -33,6 +33,8 @@ export async function getOptionTallies(env: Env, eventId: string): Promise<Optio
             v.vote, COUNT(v.user_id) AS n
      FROM event_poll_options o
      LEFT JOIN event_poll_votes v ON v.option_id = o.id
+       AND (v.user_id = (SELECT organizer_id FROM events WHERE id = o.event_id) OR
+            EXISTS (SELECT 1 FROM event_invites i WHERE i.event_id = o.event_id AND i.user_id = v.user_id))
      WHERE o.event_id = ?
      GROUP BY o.id, v.vote
      ORDER BY o.display_order`,
@@ -204,7 +206,10 @@ async function unconfirmOption(env: Env, event: EventRow, optionId: string): Pro
      WHERE id = ? AND confirmed_at IS NOT NULL
        AND NOT EXISTS (SELECT 1 FROM events c WHERE c.created_from_option_id = event_poll_options.id)
        AND EXISTS (SELECT 1 FROM events e WHERE e.id = event_poll_options.event_id
-                     AND e.status = 'active' AND e.revision = ?)`,
+                     AND e.status IN ('active', 'resolved') AND e.revision = ?
+                     AND (SELECT COUNT(*) FROM event_poll_votes v WHERE v.option_id = event_poll_options.id
+                       AND v.vote = 'yes' AND (v.user_id = e.organizer_id OR EXISTS (SELECT 1 FROM event_invites i
+                         WHERE i.event_id = e.id AND i.user_id = v.user_id))) < e.poll_threshold_count)`,
   )
     .bind(optionId, requireRevision(event))
     .run();
@@ -230,10 +235,10 @@ export async function checkThresholdAndResolve(env: Env, event: EventRow): Promi
   const tallies = await getOptionTallies(env, event.id);
 
   if (event.poll_resolution_mode === 'multi_winner') {
-    if (event.status !== 'active') return [];
+    if (event.status === 'cancelled') return [];
     const newlyConfirmed: string[] = [];
     for (const t of tallies) {
-      if (!t.confirmedAt && t.yes >= event.poll_threshold_count) {
+      if (event.status === 'active' && !t.confirmedAt && t.yes >= event.poll_threshold_count) {
         if (await confirmOption(env, event, t.id)) newlyConfirmed.push(t.id);
       } else if (t.confirmedAt && t.yes < event.poll_threshold_count) {
         // IDEAS 97. Only reaches a day that has not become its own event yet
@@ -390,6 +395,8 @@ export async function getWindowedCandidates(env: Env, eventId: string): Promise<
             a.avail_start_at, a.avail_end_at
      FROM event_poll_options o
      LEFT JOIN event_window_availability a ON a.option_id = o.id
+       AND (a.user_id = (SELECT organizer_id FROM events WHERE id = o.event_id) OR
+            EXISTS (SELECT 1 FROM event_invites i WHERE i.event_id = o.event_id AND i.user_id = a.user_id))
      WHERE o.event_id = ?
      ORDER BY o.display_order, o.id`,
   )
@@ -793,7 +800,9 @@ export async function recordPollVote(
       return { status: 'closed', reason: 'This day was called off -- too few people were still in for it' };
     }
     if (answered !== 'recorded') return { status: 'forbidden' };
-  } else if (loaded.event.status !== 'active') {
+  } else if (loaded.event.status !== 'active' && !(loaded.event.status === 'resolved' &&
+    loaded.event.poll_resolution_mode === 'multi_winner' && loaded.event.poll_strategy === 'threshold' &&
+    await env.DB.prepare('SELECT 1 FROM event_poll_options WHERE id = ? AND confirmed_at IS NOT NULL').bind(optionId).first())) {
     // Pass 24, P24-04. loadVotablePoll lets a multi-winner poll past its own
     // status check on purpose, so a day that became its own event stays
     // answerable from here after the poll closes (item 99). A day that never

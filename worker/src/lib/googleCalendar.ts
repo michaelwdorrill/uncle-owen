@@ -87,6 +87,9 @@ export interface GoogleConnectionRow {
   read_calendar_id: string | null;
   sync_enabled: number;
   status: 'active' | 'disconnecting';
+  import_run_id?: string | null;
+  import_window_start?: number | null;
+  import_page_token?: string | null;
   last_synced_at: number | null;
   last_error: string | null;
   disconnect_attempts: number;
@@ -229,7 +232,8 @@ export async function storeConnection(
   expiresInSeconds: number,
   accountEmail: string | null,
   calendarId: string,
-): Promise<void> {
+  pendingId?: string,
+): Promise<boolean> {
   const now = Date.now();
   const secret = env.GOOGLE_TOKEN_ENCRYPTION_KEY!;
   const sealedRefresh = await seal(refreshToken, secret);
@@ -269,26 +273,28 @@ export async function storeConnection(
   // (Pass-14 review, P14-07). A null on either side is an unidentified
   // connection, and treating unknown as different is what turned a failed
   // identity lookup into a revocation of the account the user was keeping.
+  if (existing?.status === 'disconnecting') return false;
   const switchingAccount =
     !!existing &&
     !!existing.google_account_email &&
     !!accountEmail &&
     existing.google_account_email !== accountEmail;
-  if (switchingAccount) {
-    const previous = await readRefreshToken(env, existing);
-    if (previous && previous !== refreshToken) await revokeToken(previous);
-  }
+
   // Reconnecting resets sync_enabled, status and last_error deliberately: the
   // most likely reason someone is back here is that the previous grant broke,
   // and leaving the row's failure state behind would mean a successful
   // reconnect that still shows an error and still doesn't sync.
-  await env.DB.prepare(
+  const written = await env.DB.prepare(
     `INSERT INTO google_calendar_connections (
        user_id, refresh_token_ciphertext, refresh_token_iv,
        access_token_ciphertext, access_token_iv, access_token_expires_at,
        google_account_email, calendar_id, sync_enabled, status,
        last_synced_at, last_error, disconnect_attempts, connected_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', NULL, NULL, 0, ?, ?)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', NULL, NULL, 0, ?, ?
+     WHERE (? IS NULL OR EXISTS (SELECT 1 FROM google_pending_connections WHERE id = ?
+            AND user_id = ? AND expires_at > ?))
+       AND NOT EXISTS (SELECT 1 FROM google_pending_connections rev WHERE rev.revoke_lease IS NOT NULL
+         AND rev.revoke_after > ? AND (rev.google_account_email IS NULL OR ? IS NULL OR LOWER(rev.google_account_email) = LOWER(?)))
      ON CONFLICT(user_id) DO UPDATE SET
        refresh_token_ciphertext = excluded.refresh_token_ciphertext,
        refresh_token_iv = excluded.refresh_token_iv,
@@ -324,7 +330,8 @@ export async function storeConnection(
        -- selected. Same account: left alone, since re-authorising a broken
        -- grant should not silently switch reading off.
        read_calendar_id = CASE WHEN ? THEN NULL ELSE read_calendar_id END,
-       updated_at = excluded.updated_at`,
+       updated_at = excluded.updated_at
+     WHERE google_calendar_connections.status != 'disconnecting'`,
   )
     .bind(
       userId,
@@ -337,12 +344,19 @@ export async function storeConnection(
       calendarId,
       now,
       now,
+      pendingId ?? null, pendingId ?? null, userId, now, now, accountEmail, accountEmail,
       // The two CASE flags, in the order their clauses appear in the SET list:
       // calendar_id first, then read_calendar_id.
       switchingAccount ? 1 : 0,
       switchingAccount ? 1 : 0,
     )
     .run();
+
+  if (!written.meta.changes) return false;
+  if (switchingAccount) {
+    const previous = await readRefreshToken(env, existing);
+    if (previous && previous !== refreshToken) await revokeToken(previous);
+  }
 
   // And the rows the old account's calendar produced, for the same reason
   // PATCH deletes them when reading is switched off: nothing will ever
@@ -369,6 +383,7 @@ export async function storeConnection(
       env.DB.prepare(`DELETE FROM google_event_links WHERE user_id = ?`).bind(userId),
     ]);
   }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -441,7 +456,10 @@ export async function storePendingConnection(
     // not finish; tearing down an authorisation on their side because a tab
     // closed would be a surprise, and the credential is gone from here
     // either way.
-    env.DB.prepare(`DELETE FROM google_pending_connections WHERE expires_at < ?`).bind(now),
+    // A freshly parked grant for this same known account now owns the Google
+    // authorization. Other expired grants need their own scheduled cleanup.
+    env.DB.prepare(`DELETE FROM google_pending_connections WHERE expires_at < ? AND revoke_lease IS NULL
+      AND google_account_email IS NOT NULL AND LOWER(google_account_email) = LOWER(?)`).bind(now, accountEmail),
   ]);
   return id;
 }
@@ -826,6 +844,7 @@ export interface ImportedCalendar {
   // The caller needs it to know whether "these are all the events" is a claim
   // it can act on.
   hasMore: boolean;
+  nextPageToken: string | null;
 }
 
 export async function listCalendarEvents(
@@ -833,13 +852,16 @@ export async function listCalendarEvents(
   calendarId: string,
   fromMs: number,
   toMs: number,
+  pageToken?: string | null,
+  pageSize = 40,
 ): Promise<ApiOutcome<ImportedCalendar>> {
   const params = new URLSearchParams({
     timeMin: new Date(fromMs).toISOString(),
     timeMax: new Date(toMs).toISOString(),
     singleEvents: 'true',
     orderBy: 'startTime',
-    maxResults: '2500',
+    maxResults: String(pageSize),
+    ...(pageToken ? { pageToken } : {}),
     fields: 'timeZone,nextPageToken,items(id,status,start,end,summary,description)',
   });
   const result = await callGoogle<{ timeZone?: string; items?: GoogleEventItem[]; nextPageToken?: string }>(
@@ -900,7 +922,7 @@ export async function listCalendarEvents(
     });
   }
 
-  return { ok: true, value: { timeZone: zone, events: imported, hasMore: !!result.value.nextPageToken } };
+  return { ok: true, value: { timeZone: zone, events: imported, hasMore: !!result.value.nextPageToken, nextPageToken: result.value.nextPageToken ?? null } };
 }
 
 export interface CalendarEventPayload {
@@ -924,26 +946,53 @@ function eventBody(payload: CalendarEventPayload): Record<string, unknown> {
     description: lines.join('\n'),
     start: { dateTime: new Date(payload.startAt).toISOString() },
     end: { dateTime: new Date(payload.endAt).toISOString() },
-    // Private to this OAuth client, invisible to the user and to anything else
-    // reading the calendar. Makes an entry identifiable as ours from Google's
-    // side -- useful for support ("why is this here"), and the handle a future
-    // reconciliation pass would need if a link row is ever lost.
-    extendedProperties: {
-      private: { uncleOwenEventId: payload.eventId, uncleOwenOccurrence: payload.occurrenceDate },
-    },
   };
 }
 
+// Google accepts lowercase base32hex event IDs. A SHA-256 hex digest is
+// within that alphabet and binds this operation to its destination and owner.
 export async function insertCalendarEvent(
   accessToken: string,
   calendarId: string,
   payload: CalendarEventPayload,
+  userId: string,
+  reserveCall: () => boolean,
 ): Promise<ApiOutcome<{ id: string }>> {
-  return callGoogle<{ id: string }>(
-    accessToken,
-    `${CALENDAR_API}/calendars/${encodeURIComponent(calendarId)}/events`,
-    { method: 'POST', body: JSON.stringify(eventBody(payload)) },
-  );
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(
+    JSON.stringify([userId, calendarId, payload.eventId, payload.occurrenceDate]),
+  ));
+  const key = Array.from(new Uint8Array(digest), n => n.toString(16).padStart(2, '0')).join('');
+  const calendar = `${CALENDAR_API}/calendars/${encodeURIComponent(calendarId)}/events`;
+  const body = eventBody(payload);
+  const marker = { private: { uncleOwenEventId: payload.eventId, uncleOwenOccurrence: payload.occurrenceDate, uncleOwenCreateKey: key } };
+  // A deleted event can reserve its ID indefinitely. Its immutable slot
+  // number gives every retry the same next ID; an unrelated live collision
+  // is left untouched and reported.
+  for (let slot = 0; ; slot++) {
+    const id = slot === 0 ? key : key + slot.toString(16);
+    const result = await callGoogle<{ id: string }>(accessToken, calendar, {
+      method: 'POST', body: JSON.stringify({ ...body, id, extendedProperties: marker }),
+    });
+    if (result.ok || result.status !== 409) return result;
+    const deferred = { ok: false, kind: 'retryable', status: 429, message: 'Google creation reconciliation will resume on a later sync' } as const;
+    if (!reserveCall()) return deferred;
+    const url = calendar + '/' + id;
+    const existing = await callGoogle<{ id: string; status?: string; extendedProperties?: { private?: { uncleOwenCreateKey?: string } } }>(
+      accessToken, url,
+    );
+    if ((!existing.ok && existing.status === 410) || (existing.ok && existing.value.status === 'cancelled')) {
+      if (!reserveCall()) return deferred;
+      continue;
+    }
+    if (!existing.ok) return existing;
+    if (existing.value.id !== id || existing.value.extendedProperties?.private?.uncleOwenCreateKey !== key) {
+      return { ok: false, kind: 'permanent', status: 409, message: 'A different entry already uses this Google event ID' };
+    }
+    if (!reserveCall()) return deferred;
+    return callGoogle<{ id: string }>(accessToken, url, {
+      method: 'PATCH', body: JSON.stringify({ ...body, extendedProperties: marker }),
+    });
+  }
 }
 
 export async function patchCalendarEvent(

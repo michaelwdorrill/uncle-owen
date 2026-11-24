@@ -24,6 +24,10 @@
       (function () {
         var v = 'homestead';
         try {
+          if (localStorage.getItem('uo.theme') === 'light') {
+            document.documentElement.dataset.theme = 'light';
+            document.querySelector('meta[name=theme-color]').content = '#EFE3CC';
+          }
           var s = localStorage.getItem('uo.scenery');
           v =
             s === 'twin-suns' || s === 'homestead'
@@ -39,6 +43,11 @@
     </script>
   </head>
   <body>
+    <noscript>
+      <h1>Uncle Owen</h1><p>Schedule sessions with your Discord friends. Optionally connect Google Calendar
+      to sync sessions or share your busy times. Enable JavaScript to sign in.</p>
+      <a href="/privacy/">Privacy Policy</a> · <a href="/terms/">Terms of Service</a>
+    </noscript>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

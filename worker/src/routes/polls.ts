@@ -92,6 +92,7 @@ pollRoutes.get('/:eventId/window', async (c) => {
     `SELECT a.option_id, a.user_id, u.username, u.global_name, a.avail_start_at, a.avail_end_at,
             att.rsvp_status AS current_rsvp_status
      FROM event_window_availability a
+     JOIN event_invites roster ON roster.event_id = a.event_id AND roster.user_id = a.user_id
      JOIN users u ON u.id = a.user_id
      LEFT JOIN event_attendance att ON att.event_id = a.event_id AND att.occurrence_date = '' AND att.user_id = a.user_id
      WHERE a.event_id = ?`,
@@ -189,7 +190,7 @@ pollRoutes.post('/:eventId/window', async (c) => {
   // invite -- this is just a direct backstop against a pre-cap event row.
   // Counted per candidate now, since that is what the table is keyed on.
   const { results: existingCount } = await c.env.DB.prepare(
-    `SELECT COUNT(*) as n FROM event_window_availability WHERE option_id = ? AND user_id != ?`,
+    `SELECT COUNT(*) as n FROM event_window_availability a JOIN event_invites i ON i.event_id = a.event_id AND i.user_id = a.user_id WHERE a.option_id = ? AND a.user_id != ?`,
   )
     .bind(optionId, userId)
     .all<{ n: number }>();

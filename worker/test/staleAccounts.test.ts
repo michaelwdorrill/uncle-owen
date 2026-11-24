@@ -181,6 +181,25 @@ describe('a fully stale account is purged', () => {
     expect(await userExists(db, 'gone')).toBe(false);
   });
 
+  it.each([
+    ['after_count', '2020-01-01', null, 2, false],
+    ['on_date', '2020-01-01', '2020-02-01', null, false],
+    ['after_count', '2090-01-31', null, 2, true],
+    ['on_date', '2090-01-31', '2091-01-31', null, true],
+  ] as const)('evaluates %s series starting %s before purging', async (endType, start, end, count, kept) => {
+    const { db, env } = setup();
+    await seedGuild(db);
+    await seedUser(db, 'owner');
+    await ageAccount(db, 'owner', 366 * DAY_MS);
+    await seedEvent(db, { id: 'series', organizerId: 'owner', startAt: null, endAt: null, isRecurring: 1 });
+    await db.prepare(`INSERT INTO event_recurrence_rules (event_id, freq, interval, by_month_day, start_date,
+      start_time, duration_minutes, end_type, end_date, end_count)
+      VALUES ('series', 'MONTHLY', 1, 31, ?, '20:00', 60, ?, ?, ?)`).bind(start, endType, end, count).run();
+    fetchStub = stubFetch([]);
+    await runReminderSweep(env);
+    expect(await userExists(db, 'owner')).toBe(kept);
+  });
+
   it('does not purge an account organising a future active event', async () => {
     const { db, env } = setup();
     await seedGuild(db);

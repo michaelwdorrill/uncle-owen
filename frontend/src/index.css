@@ -4,6 +4,72 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  color-scheme: dark;
+  --uo-ground: 26 20 16;
+  --uo-surface: 36 28 22;
+  --uo-raised: 44 35 27;
+  --uo-raised-hi: 58 46 36;
+  --uo-edge: 55 43 34;
+  --uo-edge-strong: 74 58 44;
+  --uo-ink: 240 226 204;
+  --uo-ink-soft: 228 213 190;
+  --uo-ink-dim: 214 192 160;
+  --uo-muted: 168 146 122;
+  --uo-faint: 133 113 92;
+  --uo-fainter: 107 89 69;
+  --uo-accent: 232 145 58;
+  --uo-accent-hover: 242 168 85;
+  --uo-accent-text: 240 163 79;
+  --uo-on-accent: 26 16 8;
+  --uo-accent-2: 242 200 121;
+  --uo-dusk: 139 107 160;
+  --uo-moisture: 111 168 168;
+  --uo-danger: 196 67 46;
+  --uo-danger-hover: 217 85 61;
+  --uo-danger-text: 238 138 110;
+  --uo-danger-surface: 58 29 20;
+  --uo-warning: 192 138 42;
+  --uo-warning-text: 228 177 92;
+  --uo-warning-surface: 51 38 15;
+  --uo-success: 110 140 74;
+  --uo-success-text: 168 192 119;
+  --uo-success-surface: 34 42 21;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --uo-ground: 239 227 204;
+  --uo-surface: 249 241 224;
+  --uo-raised: 233 218 192;
+  --uo-raised-hi: 223 204 170;
+  --uo-edge: 214 196 164;
+  --uo-edge-strong: 135 116 90;
+  --uo-ink: 42 32 24;
+  --uo-ink-soft: 59 45 33;
+  --uo-ink-dim: 80 64 47;
+  --uo-muted: 100 86 68;
+  --uo-faint: 105 90 71;
+  --uo-fainter: 107 89 69;
+  --uo-accent: 196 97 30;
+  --uo-accent-hover: 182 88 20;
+  --uo-accent-text: 129 61 13;
+  --uo-on-accent: 25 13 4;
+  --uo-accent-2: 217 154 43;
+  --uo-dusk: 107 83 120;
+  --uo-moisture: 55 110 110;
+  --uo-danger: 166 48 32;
+  --uo-danger-hover: 136 37 25;
+  --uo-danger-text: 134 43 27;
+  --uo-danger-surface: 247 220 208;
+  --uo-warning: 140 104 26;
+  --uo-warning-text: 104 74 8;
+  --uo-warning-surface: 246 231 187;
+  --uo-success: 89 117 58;
+  --uo-success-text: 65 85 37;
+  --uo-success-surface: 231 237 204;
+}
+
 body {
   @apply bg-ground font-sans text-ink;
 }
@@ -244,6 +310,11 @@ body {
   z-index: 0;
   overflow: hidden;
   pointer-events: none;
+}
+
+/* Keep the illustration behind text and controls legible on the light ground. */
+[data-theme='light'] .uo-sky {
+  opacity: .12;
 }
 
 [data-scenery='twin-suns'] .uo-sky {

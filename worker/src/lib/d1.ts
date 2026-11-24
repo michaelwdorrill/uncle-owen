@@ -124,3 +124,9 @@ export async function queryInChunks<T, R>(
   }
   return out;
 }
+
+/** An internal SQL predicate with bound parameters for conditional writes. */
+export interface SqlPredicate {
+  sql: string;
+  binds: unknown[];
+}

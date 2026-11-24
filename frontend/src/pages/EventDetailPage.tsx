@@ -77,7 +77,7 @@ export default function EventDetailPage() {
         ? await api.get<WindowInfo>(`/events/${eventId}/window`)
         : null;
     const changeRequests =
-      ev.status === 'active'
+      ev.status === 'active' || ev.status === 'cancelled'
         ? await api.get<ChangeRequestView[]>(`/events/${eventId}/change-requests`)
         : [];
     return { event: ev, windowInfo, changeRequests };

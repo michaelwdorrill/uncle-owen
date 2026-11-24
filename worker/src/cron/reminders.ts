@@ -3,7 +3,7 @@ import type { Env } from '../env';
 import type { EventRow, OverrideRow } from '../lib/events';
 import { loadOverridesForEvents } from '../lib/events';
 import { expandOccurrences, expandOccurrencesForEvent, loadRecurrenceRulesForEvents, type RecurrenceRule } from '../lib/recurrence';
-import { resolvePastDeadlinePolls, VOTE_AS_RSVP } from '../lib/polls';
+import { resolvePastDeadlinePolls } from '../lib/polls';
 import { resolvePastDeadlineChangeRequests } from '../lib/changeRequests';
 import {
   countConfirmedAttendees,
@@ -12,7 +12,6 @@ import {
   ladderStatusCaseBinds,
   type RsvpStatus,
 } from '../lib/attendance';
-import { inviteStatements, type ResolvedInvitee } from '../lib/eventWrites';
 import { newId } from '../lib/ids';
 import { pruneStaleSessions } from '../lib/sessions';
 import { pruneOAuthCallbackCounts } from '../lib/rateLimit';
@@ -32,7 +31,7 @@ import { editBotDm } from '../lib/discord';
 import { activeLaunchAnnouncement, launchAnnouncementImage, launchAnnouncementText } from '../lib/launchAnnouncement';
 import { cancelButton, cancelOccurrenceButton, linkButton, pollSelect, rsvpButtons } from '../lib/dmComponents';
 import { LIMITS } from '../lib/validate';
-import { chunkIds, chunkRows, conditionalRowsSql, placeholders } from '../lib/d1';
+import { chunkIds, chunkRows, placeholders } from '../lib/d1';
 import { planFrom, TickBudget } from './budget';
 import { googleSyncDue, sweepGoogleCalendar } from './googleSync';
 import {
@@ -1731,143 +1730,59 @@ async function sweepMultiWinnerPollClosedNotifications(
 // single-event path and the ladder pick it up with no special case at all
 // -- it is not a poll any more.
 //
-// The parent's invite list is copied via inviteStatements rather than a raw
-// SQL `INSERT ... SELECT`: every id in this app is minted in the Worker
-// (lib/ids.ts), never SQL-side, so a literal copy would have no correct way
-// to produce fresh invite ids.
-const ATTENDANCE_SEED_COLUMNS = ['id', 'event_id', 'occurrence_date', 'user_id', 'rsvp_status', 'responded_at'] as const;
-
-async function createFannedOutEvent(
-  env: Env,
-  budget: TickBudget,
-  opt: {
-    id: string;
-    event_id: string;
-    start_at: number;
-    end_at: number;
-    title: string;
-    guild_id: string;
-    organizer_id: string;
-    timezone: string;
-    voice_channel_id: string | null;
-    voice_channel_name: string | null;
-    is_private: number;
-    poll_threshold_count: number | null;
-    window_block_minutes: number | null;
-  },
-): Promise<RowOutcome> {
-  if (!budget.trySpend(1)) return 'incomplete';
-  const { results: parentInvites } = await env.DB.prepare(
-    `SELECT user_id, invited_via, source_group_id FROM event_invites WHERE event_id = ?`,
-  )
-    .bind(opt.event_id)
-    .all<{ user_id: string; invited_via: 'individual' | 'group'; source_group_id: string | null }>();
-
-  // Same convention inviteStatements' own comment describes: everyone starts
-  // 'pending', only the organizer's row starts 'accepted' -- rsvp_status is
-  // vestigial post-specs/0014 either way (real attendance is event_attendance),
-  // but the column stays NOT NULL until it is dropped outright.
-  const invitees: ResolvedInvitee[] = parentInvites.map((row) => ({
-    userId: row.user_id,
-    invitedVia: row.invited_via,
-    sourceGroupId: row.source_group_id,
-    rsvpStatus: row.user_id === opt.organizer_id ? 'accepted' : 'pending',
-  }));
-
-  // IDEAS 97: a fixed-slot day stays on only while it keeps the poll's
-  // threshold. Rather than a second cancel path, the day's event carries the
-  // threshold as its own minimum with auto-cancel on, so the ordinary
-  // minimum-attendees cascade in recordRsvp -- reviewed, and already telling
-  // everyone still coming -- is what calls it off. That only means something
-  // if the people who said "I'm in" for this day start out counted, so their
-  // yes is carried over as an accepted answer; before this the day's event
-  // started with nobody but the organizer and asked everyone again.
-  //
-  // EVERY answer is carried, not only yes (Pass 24 review, P24-02; Michael's
-  // call, 9 Nov 2026). Carrying only yes left a no-voter as "no answer" on the
-  // day -- and for the ORGANIZER that is not neutral: with no attendance row
-  // they count as going by default (ORGANIZER_UNLESS_DECLINED), so an organizer
-  // who voted "Can't make it" was shown "yes" on the poll row and counted
-  // toward the minimum, and the day survived one dropout more than its
-  // threshold allows. A vote on a confirmed day is that day's answer, which is
-  // the reading item 97 already applies to votes cast after fan-out; this
-  // applies it to the ones cast before. It also stops no-voters being reminded
-  // about a night they declined.
-  //
-  // Windowed polls keep the old shape: their answers are ranges, and how a
-  // withdrawn range should un-confirm a day is a separate question (IDEAS 97).
-  const keepsThreshold = opt.window_block_minutes == null && opt.poll_threshold_count != null;
-  let carriedVotes: { user_id: string; vote: 'yes' | 'no' | 'maybe' }[] = [];
-  if (keepsThreshold) {
-    if (!budget.trySpend(1)) return 'incomplete';
-    const { results } = await env.DB.prepare(
-      `SELECT v.user_id, v.vote FROM event_poll_votes v
-       WHERE v.option_id = ?
-         AND EXISTS (SELECT 1 FROM event_invites i WHERE i.event_id = ? AND i.user_id = v.user_id)`,
-    )
-      .bind(opt.id, opt.event_id)
-      .all<{ user_id: string; vote: 'yes' | 'no' | 'maybe' }>();
-    carriedVotes = results;
-  }
-
-  const newEventId = newId();
+// The option, its parent, its roster and its answers are read inside the
+// same transaction. A vote or edit between discovery and insertion is visible.
+async function createFannedOutEvent(env: Env, budget: TickBudget, optionId: string): Promise<RowOutcome> {
+  if (!budget.trySpend(3)) return 'incomplete';
+  const childId = newId();
   const now = Date.now();
-  const inviteStmts = inviteStatements(env, newEventId, invitees, true);
-  const attendanceStmts = chunkRows(carriedVotes, ATTENDANCE_SEED_COLUMNS.length, 1).map((chunk) =>
+  // A fixed threshold must still have enough eligible votes at insert time.
+  const lostQuorum = `p.poll_strategy = 'threshold' AND p.window_block_minutes IS NULL
+    AND p.poll_threshold_count IS NOT NULL AND (SELECT COUNT(*) FROM event_poll_votes v
+      WHERE v.option_id = o.id AND v.vote = 'yes' AND (v.user_id = p.organizer_id OR EXISTS (
+        SELECT 1 FROM event_invites i WHERE i.event_id = p.id AND i.user_id = v.user_id))) < p.poll_threshold_count`;
+  const [insert] = await env.DB.batch([
     env.DB.prepare(
-      conditionalRowsSql(
-        'event_attendance',
-        ATTENDANCE_SEED_COLUMNS,
-        chunk.length,
-        'events',
-        'ON CONFLICT(event_id, occurrence_date, user_id) DO NOTHING',
-      ),
-    ).bind(
-      ...chunk.flatMap(({ user_id, vote }) => [newId(), newEventId, '', user_id, VOTE_AS_RSVP[vote], now]),
-      newEventId,
-    ),
-  );
-  if (!budget.trySpend(1 + inviteStmts.length + attendanceStmts.length)) return 'incomplete';
-
-  await env.DB.batch([
+      `INSERT INTO events (id, guild_id, organizer_id, title, event_type, timezone, start_at, end_at,
+         status, poll_mode, poll_resolution_mode, is_recurring, voice_channel_id, voice_channel_name,
+         created_from_poll_id, created_from_option_id, is_private, minimum_attendees, auto_cancel_below_minimum,
+         created_at, updated_at)
+       SELECT ?, p.guild_id, p.organizer_id, p.title, 'single', p.timezone, o.start_at, o.end_at,
+         'active', 'options', 'single_winner', 0, p.voice_channel_id, p.voice_channel_name,
+         p.id, o.id, p.is_private, CASE WHEN p.window_block_minutes IS NULL THEN p.poll_threshold_count END,
+         (p.window_block_minutes IS NULL AND p.poll_threshold_count IS NOT NULL), ?, ?
+       FROM event_poll_options o JOIN events p ON p.id = o.event_id
+       WHERE o.id = ? AND o.confirmed_at IS NOT NULL AND p.status != 'cancelled'
+         AND p.poll_resolution_mode = 'multi_winner' AND (${lostQuorum}) IS NOT TRUE
+         AND NOT EXISTS (SELECT 1 FROM events child WHERE child.created_from_option_id = o.id)`,
+    ).bind(childId, now, now, optionId),
+    // An invite's parent key is already unique. Prefix it with the new event's
+    // UUID to mint each internal child-row key without a separate roster read.
     env.DB.prepare(
-      `INSERT INTO events (id, guild_id, organizer_id, title, description, game, event_type, timezone,
-         start_at, end_at, status, poll_strategy, poll_threshold_count, poll_deadline_at,
-         poll_mode, poll_resolution_mode, window_start_at, window_end_at, window_block_minutes,
-         is_recurring, voice_channel_id, voice_channel_name, created_from_poll_id, created_from_option_id,
-         is_private, minimum_attendees, auto_cancel_below_minimum, created_at, updated_at)
-       SELECT ?, ?, ?, ?, NULL, NULL, 'single', ?, ?, ?, 'active', NULL, NULL, NULL,
-         'options', 'single_winner', NULL, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?
-       WHERE NOT EXISTS (SELECT 1 FROM events WHERE created_from_option_id = ?)`,
-    ).bind(
-      newEventId,
-      opt.guild_id,
-      opt.organizer_id,
-      opt.title,
-      opt.timezone,
-      opt.start_at,
-      opt.end_at,
-      opt.voice_channel_id,
-      opt.voice_channel_name,
-      opt.event_id,
-      opt.id,
-      // Pass-11 review (F-18 / R03): omitted here, so migration 0038's
-      // default (0 = on the noticeboard) applied to every spawned day and a
-      // deliberately private poll published its title, time, organiser and
-      // full invitee list to the whole server the moment one option
-      // confirmed. Inherited from the parent, which is the only answer
-      // consistent with 0038's promise that an organiser can keep any event
-      // off the noticeboard.
-      opt.is_private,
-      keepsThreshold ? opt.poll_threshold_count : null,
-      keepsThreshold ? 1 : 0,
-      now,
-      now,
-      opt.id,
-    ),
-    ...inviteStmts,
-    ...attendanceStmts,
+      `INSERT INTO event_invites (id, event_id, user_id, invited_via, source_group_id, rsvp_status, invited_at)
+       SELECT c.id || ':' || i.id, c.id, i.user_id, i.invited_via, i.source_group_id,
+         CASE WHEN i.user_id = c.organizer_id THEN 'accepted' ELSE 'pending' END, ?
+       FROM events c JOIN event_invites i ON i.event_id = c.created_from_poll_id WHERE c.id = ?`,
+    ).bind(now, childId),
+    env.DB.prepare(
+      `INSERT INTO event_attendance (id, event_id, occurrence_date, user_id, rsvp_status, responded_at)
+       SELECT i.id, c.id, '', i.user_id, CASE v.vote WHEN 'no' THEN 'declined' WHEN 'maybe' THEN 'tentative' ELSE 'accepted' END, ?
+       FROM events c JOIN events p ON p.id = c.created_from_poll_id JOIN event_invites i ON i.event_id = c.id
+       LEFT JOIN event_poll_votes v ON c.minimum_attendees IS NOT NULL AND v.option_id = c.created_from_option_id AND v.user_id = i.user_id
+       WHERE c.id = ? AND (v.vote IS NOT NULL OR (p.window_block_minutes IS NOT NULL AND EXISTS (
+         SELECT 1 FROM event_window_availability a WHERE a.option_id = c.created_from_option_id AND a.user_id = i.user_id
+           AND a.avail_start_at <= c.start_at AND a.avail_end_at >= c.end_at)))`,
+    ).bind(now, childId),
   ]);
+  if (!insert.meta.changes) {
+    // Recheck before clearing, since another vote may have restored quorum.
+    if (!budget.trySpend(1)) return 'incomplete';
+    await env.DB.prepare(
+      `UPDATE event_poll_options AS o SET confirmed_at = NULL WHERE o.id = ? AND o.confirmed_at IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM events child WHERE child.created_from_option_id = o.id)
+       AND EXISTS (SELECT 1 FROM events p WHERE p.id = o.event_id AND ${lostQuorum})`,
+    ).bind(optionId).run();
+  }
 }
 
 // Multi-winner polls confirm individual days as soon as they hit quorum
@@ -1884,35 +1799,19 @@ async function sweepConfirmedMultiWinnerOptions(
   budget: TickBudget,
   cursors: CursorStore,
 ): Promise<void> {
-  await forEachGlobalRow<{
-    id: string;
-    event_id: string;
-    start_at: number;
-    end_at: number;
-    title: string;
-    guild_id: string;
-    organizer_id: string;
-    timezone: string;
-    voice_channel_id: string | null;
-    voice_channel_name: string | null;
-    is_private: number;
-    poll_threshold_count: number | null;
-    window_block_minutes: number | null;
-  }>(
+  await forEachGlobalRow<{ id: string }>(
     env,
     budget,
     cursors,
     'confirmed_options',
-    `SELECT epo.id AS id, epo.event_id, epo.start_at, epo.end_at, e.title, e.guild_id, e.organizer_id,
-            e.timezone, e.voice_channel_id, e.voice_channel_name, e.is_private,
-            e.poll_threshold_count, e.window_block_minutes
+    `SELECT epo.id AS id
      FROM event_poll_options epo
      JOIN events e ON e.id = epo.event_id
      WHERE e.poll_resolution_mode = 'multi_winner' AND epo.confirmed_at IS NOT NULL
        AND e.status != 'cancelled'
        AND NOT EXISTS (SELECT 1 FROM events fanned WHERE fanned.created_from_option_id = epo.id)`,
     [],
-    (opt) => createFannedOutEvent(env, budget, opt),
+    (opt) => createFannedOutEvent(env, budget, opt.id),
     'epo.id',
   );
 }
@@ -2020,10 +1919,24 @@ async function sweepCancellationCascade(
        FROM events
        WHERE status = 'cancelled' AND is_recurring = 0
          AND updated_at >= ?
+         AND (invite_edit_due = 1 OR event_type = 'poll' OR EXISTS (
+           SELECT 1 FROM users u JOIN user_guild_membership m ON m.user_id = u.id AND m.guild_id = events.guild_id
+             AND m.is_member = 1 AND m.verified_at >= ?
+           JOIN guilds g ON g.id = m.guild_id AND g.is_active = 1
+           LEFT JOIN notification_log nl ON nl.event_id = events.id AND nl.user_id = u.id AND nl.occurrence_date = ''
+             AND nl.notification_type = CASE WHEN events.cancelled_by_organizer = 0 AND events.minimum_attendees IS NOT NULL
+               THEN 'event_cancelled_below_minimum' ELSE 'event_cancelled' END
+           WHERE ${PENDING_NOTIFICATION_WHERE}
+             AND ((events.cancelled_by_organizer = 0 AND u.id = events.organizer_id AND NOT EXISTS (
+               SELECT 1 FROM event_attendance a WHERE a.event_id = events.id AND a.user_id = u.id
+                 AND a.occurrence_date = '' AND a.rsvp_status = 'declined'))
+               OR (u.id != events.organizer_id AND EXISTS (SELECT 1 FROM event_attendance a JOIN event_invites i
+                 ON i.event_id = a.event_id AND i.user_id = a.user_id WHERE a.event_id = events.id AND a.user_id = u.id
+                   AND a.occurrence_date = '' AND a.rsvp_status = 'accepted')))))
        LIMIT ?
      )`,
   )
-    .bind(GLOBAL_SCAN_LIMIT, terminalHistoryHotCutoff(), GLOBAL_SCAN_LIMIT)
+    .bind(GLOBAL_SCAN_LIMIT, terminalHistoryHotCutoff(), membershipCutoff(), ...pendingNotificationWhereBinds(), GLOBAL_SCAN_LIMIT)
     .all<EventRow & { kind: 'prompt' | 'notice'; minimum_attendees: number | null; invite_edit_due: number }>();
 
   for (const row of results) {
@@ -2088,7 +2001,7 @@ async function maybeSendOrganizerCancelPrompt(
 }
 
 function cancelledEventMessage(env: Env, event: EventRow & { minimum_attendees: number | null }): string {
-  return event.minimum_attendees != null
+  return cancelledNoticeType(event) === 'event_cancelled_below_minimum'
     ? `"${event.title}" has been cancelled -- attendance dropped below the minimum for it.\n${eventLink(env, event.id)}`
     : `"${event.title}" has been cancelled by the organizer.\n${eventLink(env, event.id)}`;
 }
@@ -2098,8 +2011,8 @@ function cancelledEventMessage(env: Env, event: EventRow & { minimum_attendees: 
 // that message states a reason ("attendance dropped below the minimum")
 // that isn't true for it, and the two need separate notification_log rows
 // anyway since dedupe is keyed on notification_type.
-function cancelledNoticeType(event: { minimum_attendees: number | null }): NotificationType {
-  return event.minimum_attendees != null ? 'event_cancelled_below_minimum' : 'event_cancelled';
+function cancelledNoticeType(event: EventRow): NotificationType {
+  return !event.cancelled_by_organizer && event.minimum_attendees != null ? 'event_cancelled_below_minimum' : 'event_cancelled';
 }
 
 async function sendCancelledEventNotice(
@@ -2117,6 +2030,7 @@ async function sendCancelledEventNotice(
     notificationType,
     occurrenceDate: '',
     limit,
+    excludeUserId: event.cancelled_by_organizer ? event.organizer_id : undefined,
   });
   const message = cancelledEventMessage(env, event);
   await notifyPending(env, budget, pending, event.id, notificationType, '', () => message);
@@ -3223,17 +3137,39 @@ function staleAccountWarningContent(
 // scheduled. A poll with no candidate resolved yet has start_at IS NULL and
 // counts as "hasn't happened", same reasoning.
 async function hasUpcomingStake(env: Env, userId: string, now: number): Promise<boolean> {
-  const row = await env.DB.prepare(
-    `SELECT 1 FROM events WHERE organizer_id = ? AND status = 'active' AND (start_at IS NULL OR start_at > ?)
-     UNION
-     SELECT 1 FROM event_invites ei JOIN events e ON e.id = ei.event_id
-       WHERE ei.user_id = ? AND ei.rsvp_status != 'declined'
-         AND e.status = 'active' AND (e.start_at IS NULL OR e.start_at > ?)
-     LIMIT 1`,
-  )
-    .bind(userId, now, userId, now)
-    .first();
-  return row != null;
+  // A one-off, unresolved poll or open-ended series can settle the common
+  // case in one read. Finite series share the calendar's rule and override
+  // interpretation, including monthly skips and moves past the nominal end.
+  const access = `(e.organizer_id = ? OR EXISTS (SELECT 1 FROM event_invites i WHERE
+    i.event_id = e.id AND i.user_id = ? AND i.rsvp_status != 'declined'))`;
+  const straightforward = await env.DB.prepare(
+    `SELECT 1 FROM events e LEFT JOIN event_recurrence_rules r ON r.event_id = e.id
+     WHERE e.status = 'active' AND ${access} AND (
+       (e.is_recurring = 0 AND (e.start_at IS NULL OR e.start_at > ?))
+       OR (e.is_recurring = 1 AND (r.end_type = 'never' OR r.event_id IS NULL))) LIMIT 1`,
+  ).bind(userId, userId, now).first();
+  if (straightforward) return true;
+  const { results: series } = await env.DB.prepare(
+    `SELECT e.id, e.timezone FROM events e WHERE e.is_recurring = 1 AND e.status = 'active' AND ${access}`,
+  ).bind(userId, userId).all<{ id: string; timezone: string }>();
+  const ids = series.map(event => event.id);
+  const rules = await loadRecurrenceRulesForEvents(env, ids);
+  const overrides = await loadOverridesForEvents(env, ids);
+  return series.some(event => {
+    const rule = rules.get(event.id);
+    if (!rule || rule.endType === 'never') return true;
+    const changes = overrides.get(event.id) ?? [];
+    if (!DateTime.fromISO(rule.startDate, { zone: event.timezone }).isValid) return true;
+    const lastMoved = changes.reduce((last, change) => Math.max(last, change.override_end_at ?? 0), 0);
+    // For count-limited series the expander fast-forwards to now and stops at
+    // the last real occurrence. It can stop as soon as it finds a future one.
+    const end = rule.endType === 'on_date' && rule.endDate
+      ? DateTime.fromISO(rule.endDate, { zone: event.timezone }).endOf('day').plus({ minutes: rule.durationMinutes }).toMillis()
+      : 8.64e15 - DAY_MS;
+    if (Math.max(end, lastMoved) <= now) return false;
+    return expandOccurrences(rule, event.timezone, now, Math.max(end, lastMoved), changes, true)
+      .some(occ => occ.endAt > now);
+  });
 }
 
 // One combined scan rather than a warning sweep and a purge sweep, for the
@@ -3343,7 +3279,9 @@ async function sweepStaleAccounts(env: Env, budget: TickBudget): Promise<void> {
 }
 
 interface DueRetryRow extends DmRecipient {
+  event_type: string;
   id: string;
+  user_id: string;
   event_id: string;
   notification_type: NotificationType;
   components: string | null;
@@ -3390,7 +3328,7 @@ async function sweepDueNotificationRetries(env: Env, budget: TickBudget, cursors
     budget,
     cursors,
     'due_notification_retries',
-    `SELECT nl.id, nl.user_id AS id, nl.event_id, nl.notification_type, nl.occurrence_date, nl.content,
+    `SELECT nl.id, nl.user_id, e.event_type, nl.event_id, nl.notification_type, nl.occurrence_date, nl.content,
             nl.components,
             u.notifications_enabled, u.dm_channel_id, u.timezone
      FROM notification_log nl
@@ -3422,6 +3360,14 @@ async function sweepDueNotificationRetries(env: Env, budget: TickBudget, cursors
        )
        AND (nl.claimed_until IS NULL OR nl.claimed_until < ?)
        AND nl.content IS NOT NULL
+       AND (nl.notification_type != 'voice_channel_invite' OR e.event_type != 'single' OR (
+         e.status IN ('active', 'resolved') AND (nl.occurrence_date != '') = e.is_recurring
+         AND NOT EXISTS (SELECT 1 FROM event_occurrence_overrides ov WHERE ov.event_id = e.id
+           AND ov.occurrence_date = nl.occurrence_date AND ov.is_cancelled = 1)
+         AND ((u.id = e.organizer_id AND NOT EXISTS (SELECT 1 FROM event_attendance a
+                WHERE a.event_id = e.id AND a.occurrence_date = nl.occurrence_date AND a.user_id = u.id AND a.rsvp_status = 'declined'))
+              OR EXISTS (SELECT 1 FROM event_attendance a WHERE a.event_id = e.id
+                AND a.occurrence_date = nl.occurrence_date AND a.user_id = u.id AND a.rsvp_status = 'accepted'))))
        -- Pass-11 review (R09): still authorized on the *event*, not merely
        -- still in its server. This consumer checked guild membership and
        -- notifications_enabled but never that the recipient is still invited,
@@ -3438,11 +3384,36 @@ async function sweepDueNotificationRetries(env: Env, budget: TickBudget, cursors
     [membershipCutoff(), Date.now(), Date.now(), Date.now()],
     async (row) => {
       if (budget.exhausted) return 'incomplete';
+      if (row.notification_type === 'voice_channel_invite' && row.event_type === 'poll') {
+        if (!budget.trySpend(2)) return 'incomplete';
+        const event = await env.DB.prepare(
+          `SELECT e.*, o.start_at AS option_start, o.end_at AS option_end
+           FROM events p
+           LEFT JOIN event_poll_options o ON p.poll_resolution_mode = 'multi_winner'
+              AND o.event_id = p.id AND o.id = ? AND o.confirmed_at IS NOT NULL
+           LEFT JOIN events child ON child.created_from_option_id = o.id
+           JOIN events e ON e.id = COALESCE(child.id, p.id)
+           WHERE p.id = ? AND p.status != 'cancelled' AND e.status != 'cancelled'
+             AND (p.poll_resolution_mode != 'multi_winner' OR o.id IS NOT NULL)
+             AND NOT EXISTS (SELECT 1 FROM event_occurrence_overrides ov WHERE ov.event_id = e.id
+               AND ov.occurrence_date = ? AND ov.is_cancelled = 1)`,
+        ).bind(row.occurrence_date, row.event_id, row.occurrence_date)
+          .first<EventRow & { option_start: number | null; option_end: number | null }>();
+        if (!event) return;
+        const attendees = await getConfirmedAttendeeIds(env, {
+          ...event, start_at: event.option_start ?? event.start_at, end_at: event.option_end ?? event.end_at,
+        }, event.poll_resolution_mode === 'multi_winner' ? row.occurrence_date : event.resolved_option_id,
+        event.is_recurring ? row.occurrence_date : '', {
+          notificationType: row.notification_type, occurrenceDate: row.occurrence_date, limit: 1,
+          recipientId: row.user_id, notificationEventId: row.event_id,
+        });
+        if (!attendees.length) return;
+      }
       await deliverThroughOutbox(
         env,
         'notification_log',
-        { user_id: row.id, event_id: row.event_id, notification_type: row.notification_type, occurrence_date: row.occurrence_date },
-        row,
+        { user_id: row.user_id, event_id: row.event_id, notification_type: row.notification_type, occurrence_date: row.occurrence_date },
+        { ...row, id: row.user_id },
         row.content,
         budget,
         // Carried forward rather than re-derived, for migration 0014's
@@ -3451,7 +3422,7 @@ async function sweepDueNotificationRetries(env: Env, budget: TickBudget, cursors
         // produce it, and a poll's candidate list is the clearest case of
         // that. Unparseable JSON degrades to no components -- the retry
         // still delivers the text, which is what the recipient is owed.
-        parseStoredComponents(row.components, row.id),
+        parseStoredComponents(row.components, row.user_id),
       );
       if (budget.exhausted) return 'incomplete';
     },
@@ -3780,28 +3751,43 @@ export async function runReminderSweep(env: Env): Promise<void> {
   await runIsolated('launchAnnouncement', () => sweepLaunchAnnouncement(env, budget, cursors));
   await runIsolated('pollDeadlines', () => sweepPollDeadlines(env, budget));
   await runIsolated('changeRequestDeadlines', () => sweepChangeRequestDeadlines(env, budget));
-  await runIsolated('singleWinnerPollNotifications', () => sweepSingleWinnerPollNotifications(env, budget, cursors));
-  await runIsolated('multiWinnerPollClosedNotifications', () =>
-    sweepMultiWinnerPollClosedNotifications(env, budget, cursors),
-  );
-  await runIsolated('confirmedMultiWinnerOptions', () => sweepConfirmedMultiWinnerOptions(env, budget, cursors));
-  // Filled by the cancellation sweep, drained after new invites -- see
-  // sweepCancelledInviteEdits.
   const cancelledInviteEditsDue: CancelledEvent[] = [];
-  await runIsolated('cancellationCascade', () => sweepCancellationCascade(env, budget, cancelledInviteEditsDue));
-  await runIsolated('minimumAttendeesDeadlines', () => sweepMinimumAttendeesDeadlines(env, budget, cursors));
-  await runIsolated('minimumAttendeesDeadlineWarnings', () =>
-    sweepMinimumAttendeesDeadlineWarnings(env, budget, cursors),
-  );
-  await runIsolated('newInvites', () => sweepNewInvites(env, budget));
+  const deliveries: Record<string, () => Promise<void>> = {
+    newInvites: () => sweepNewInvites(env, budget),
+    changeRequestNotifications: () => sweepChangeRequestNotifications(env, budget),
+    reminders: () => sweepReminders(env, budget, cursors),
+    pollDeadlineReminders: () => sweepPollDeadlineReminders(env, budget, cursors),
+    voiceChannelInvites: () => sweepVoiceChannelInvites(env, budget, cursors),
+    idleGroups: () => sweepIdleGroups(env, budget, cursors),
+    groupDrift: () => sweepGroupDrift(env, budget),
+    organizerRsvpNotices: () => sweepOrganizerRsvpNotices(env, budget),
+    dueNotificationRetries: () => sweepDueNotificationRetries(env, budget, cursors),
+    dueNudgeRetries: () => sweepDueNudgeRetries(env, budget, cursors),
+  };
+  const order = Object.keys(deliveries);
+  const focus = cursors.get('notification_turn');
+  const deferred: string[] = [];
+  const runDelivery = async (name: string) => {
+    if (name === focus) return;
+    if (budget.exhausted) deferred.push(name);
+    await runIsolated(name, deliveries[name]);
+  };
+
+  const settleEvents = async () => {
+    await runIsolated('singleWinnerPollNotifications', () => sweepSingleWinnerPollNotifications(env, budget, cursors));
+    await runIsolated('multiWinnerPollClosedNotifications', () => sweepMultiWinnerPollClosedNotifications(env, budget, cursors));
+    await runIsolated('confirmedMultiWinnerOptions', () => sweepConfirmedMultiWinnerOptions(env, budget, cursors));
+    await runIsolated('cancellationCascade', () => budget.withHalfBudget(() => sweepCancellationCascade(env, budget, cancelledInviteEditsDue)));
+    await runIsolated('minimumAttendeesDeadlines', () => sweepMinimumAttendeesDeadlines(env, budget, cursors));
+    await runIsolated('minimumAttendeesDeadlineWarnings', () => sweepMinimumAttendeesDeadlineWarnings(env, budget, cursors));
+  };
+  if (focus && deliveries[focus]) {
+    await budget.withHalfBudget(() => runIsolated(focus, deliveries[focus]));
+  }
+  await settleEvents();
+  await runDelivery('newInvites');
   await runIsolated('cancelledInviteEdits', () => sweepCancelledInviteEdits(env, budget, cancelledInviteEditsDue));
-  await runIsolated('changeRequestNotifications', () => sweepChangeRequestNotifications(env, budget));
-  await runIsolated('reminders', () => sweepReminders(env, budget, cursors));
-  await runIsolated('pollDeadlineReminders', () => sweepPollDeadlineReminders(env, budget, cursors));
-  await runIsolated('voiceChannelInvites', () => sweepVoiceChannelInvites(env, budget, cursors));
-  await runIsolated('idleGroups', () => sweepIdleGroups(env, budget, cursors));
-  await runIsolated('groupDrift', () => sweepGroupDrift(env, budget));
-  await runIsolated('organizerRsvpNotices', () => sweepOrganizerRsvpNotices(env, budget));
+  for (const name of order.slice(1, -2)) await runDelivery(name);
   await runIsolated('pruneStaleSessions', () => pruneStaleSessions(env));
   await runIsolated('pruneOAuthCallbackCounts', () => pruneOAuthCallbackCounts(env));
   await runIsolated('purgeTerminalHistory', () => sweepPurgeTerminalHistory(env, budget));
@@ -3811,8 +3797,8 @@ export async function runReminderSweep(env: Env): Promise<void> {
   // next_attempt_at. Run before reaping so a row that just became due gets a
   // chance at delivery in the same tick it's picked up in, rather than
   // possibly being reaped on a tick it was never actually retried.
-  await runIsolated('dueNotificationRetries', () => sweepDueNotificationRetries(env, budget, cursors));
-  await runIsolated('dueNudgeRetries', () => sweepDueNudgeRetries(env, budget, cursors));
+  await runDelivery('dueNotificationRetries');
+  await runDelivery('dueNudgeRetries');
   // Last of the budget-charged sweeps, deliberately: its own threshold is a
   // year of inactivity, so it has nothing to lose by going last and being the
   // one starved on a busy tick, and everything above it (same-day reminders,
@@ -3827,6 +3813,9 @@ export async function runReminderSweep(env: Env): Promise<void> {
   // Persisted once, after every sweep has had its turn. Isolated like the
   // sweeps themselves: losing the cursor write costs a tick of re-scanning,
   // which the outbox dedupes, and must not mask a tick that otherwise worked.
+  const nextFocus = budget.exhausted || deferred.length ? order[(order.indexOf(focus ?? '') + 1) % order.length] : null;
+  if (nextFocus || focus) cursors.set('notification_turn', nextFocus);
+  console.log('Reminder budget', JSON.stringify({ remaining: budget.remaining(), deferred, nextFocus }));
   await runIsolated('flushCursors', () => cursors.flush());
 
   // Routinely hitting zero means work is being deferred every tick, which is

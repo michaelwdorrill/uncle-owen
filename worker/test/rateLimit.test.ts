@@ -128,6 +128,9 @@ describe('the OAuth callbacks are bounded (item 92, bar clause 3)', () => {
 
     const res = await realLoginCallback(env, IP, 'b');
     expect(res.status).toBe(429);
+    expect(res.headers.get('Retry-After')).toBe('60');
+    expect(res.headers.get('Content-Type')).toContain('text/html');
+    expect(await res.text()).toContain('Return to Uncle Owen');
     // The whole point: the refusal costs Discord nothing.
     expect(tokenEndpointCalls(fetchStub).length).toBe(0);
   });
@@ -272,6 +275,9 @@ describe('the OAuth callbacks are bounded (item 92, bar clause 3)', () => {
     );
 
     expect(res.status).toBe(429);
+    expect(res.headers.get('Retry-After')).toBe('60');
+    expect(res.headers.get('Content-Type')).toContain('text/html');
+    expect(await res.text()).toContain('Return to Uncle Owen');
     expect(tokenEndpointCalls(fetchStub)).toEqual([]);
   });
   // Included even though production ships GOOGLE_SYNC_MODE = "off", where
