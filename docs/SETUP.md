@@ -1150,7 +1150,7 @@ The reminder Worker processes work in this order:
 
 | Work | Position and budget |
 | --- | --- |
-| Due Google syncs, membership checks and the launch announcement | Run first. Google imports one page per connection per tick. Membership checks and the announcement have per-tick caps. Synthetic seed membership IDs skip Discord revalidation. |
+| Due Google syncs, membership checks | Run first. Google imports one page per connection per tick. Membership checks have a per-tick cap. Synthetic seed membership IDs skip Discord revalidation. |
 | Poll and change-request deadlines | Settle decisions before delivering their notices. |
 | Poll notices and fan-out, cancellation notices, minimum-attendance deadlines and warnings | Newly confirmed sessions and cancellations are recorded before their invite edits. Cancellation notices use at most half the remaining allowance. |
 | New invites, cancelled-invite edits, change-request notices, reminders, poll deadlines, voice invites, idle groups, group drift and organizer RSVP notices | This is the ordinary delivery order. After exhaustion, the next tick gives one delivery sweep an early turn using up to half the remaining allowance. The turn rotates and includes both retry consumers. |

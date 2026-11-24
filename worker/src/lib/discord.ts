@@ -1,5 +1,4 @@
 import { dmEmbeds } from './dmComponents';
-import type { DmAttachment } from './launchAnnouncement';
 
 const API_BASE = 'https://discord.com/api/v10';
 
@@ -396,11 +395,6 @@ export async function sendBotDm(
   // assembled them; this module does not build them (lib/dmComponents.ts
   // does) and does not interpret them.
   components?: unknown[] | null,
-  // One file sent with the message -- only the 1.0 launch announcement's
-  // picture (lib/launchAnnouncement.ts). Present means the request goes as
-  // multipart/form-data, Discord's only way to upload a file; the JSON part is
-  // unchanged and travels as `payload_json`.
-  attachment?: DmAttachment | null,
 ): Promise<{ result: DmSendResult; channelId: string | null; messageId: string | null }> {
   let channelId = existingChannelId ?? null;
 
@@ -449,22 +443,11 @@ export async function sendBotDm(
         // components) and this is a message-create, where there is nothing
         // to clear.
         ...(components && components.length > 0 ? { components } : {}),
-        ...(attachment ? { attachments: [{ id: 0, filename: attachment.filename }] } : {}),
       });
-    let body: string | FormData = payload;
-    const headers: Record<string, string> = { Authorization: `Bot ${botToken}` };
-    if (attachment) {
-      // No Content-Type header here: fetch sets it, boundary included.
-      body = new FormData();
-      body.append('payload_json', payload);
-      body.append('files[0]', new Blob([attachment.bytes], { type: attachment.contentType }), attachment.filename);
-    } else {
-      headers['Content-Type'] = 'application/json';
-    }
     messageRes = await fetch(`${API_BASE}/channels/${channelId}/messages`, {
       method: 'POST',
-      headers,
-      body,
+      headers: { Authorization: `Bot ${botToken}`, 'Content-Type': 'application/json' },
+      body: payload,
       signal: AbortSignal.timeout(DISCORD_FETCH_TIMEOUT_MS),
     });
   } catch {

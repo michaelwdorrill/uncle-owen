@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { deleteUserCompletely } from "../src/lib/db";
 import { buildApp } from "../src/router";
 import { createSession } from "../src/lib/sessions";
 import { signJwt } from "../src/lib/jwt";
@@ -104,4 +105,24 @@ describe("the data export leaves nothing out (D-07)", () => {
       expect(leaked, `${section} exports a credential`).toEqual([]);
     }
   });
+  it("preserves archived 1.0 records until the user deletes their account", async () => {
+    const { db, env } = setup();
+    await seedUser(db, "u1");
+    await db.prepare("UPDATE users SET announcement_seen = '1.0' WHERE id = 'u1'").run();
+    await db.prepare("INSERT INTO announcement_log (id, user_id, announcement_id, sent_at, delivered_at) VALUES ('notice', 'u1', '1.0', 1, 1)").run();
+    const { id } = await createSession(env, "u1");
+    const token = await signJwt("u1", id, env.JWT_SIGNING_KEY);
+    const headers = { Authorization: `Bearer ${token}` };
+    const app = buildApp();
+    const res = await app.request("https://worker.test/me/export", { headers }, env);
+    expect(res.status).toBe(200);
+    const exported = await res.json() as { profile: { announcement_seen: string }[], launchAnnouncements: { id: string }[] };
+    expect(exported.profile[0].announcement_seen).toBe("1.0");
+    expect(exported.launchAnnouncements[0].id).toBe("notice");
+    const profile = await app.request("https://worker.test/me", { headers }, env);
+    expect(await profile.json()).not.toHaveProperty("unseenAnnouncement");
+    await deleteUserCompletely(env, "u1");
+    expect(await db.prepare("SELECT id FROM announcement_log WHERE user_id = 'u1'").first()).toBeNull();
+  });
+
 });

@@ -9,7 +9,7 @@ function user(accepted: number, inForce: number): User {
   return {
     id: 'u', username: 'u', globalName: null, avatarHash: null, timezone: 'UTC',
     notificationsEnabled: true, freeBusyVisible: true, isOwner: false,
-    policyVersion: inForce, acceptedPolicyVersion: accepted, unseenAnnouncement: null,
+    policyVersion: inForce, acceptedPolicyVersion: accepted,
   };
 }
 

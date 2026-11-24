@@ -63,11 +63,6 @@ export interface FetchStub {
   // token was revoked" are indistinguishable, and only the second one is the
   // property worth having. Anything else records as null.
   bodies: (string | null)[];
-  // multipart/form-data bodies, in the same order (null for every other
-  // kind). Only the launch announcement's DM sends one -- its picture is a
-  // file upload -- and its JSON part is also recorded in `bodies`, as
-  // payload_json, so the usual body assertions read it unchanged.
-  forms: (FormData | null)[];
   restore: () => void;
 }
 
@@ -76,22 +71,17 @@ export interface FetchStub {
 export function stubFetch(rules: FetchRule[]): FetchStub {
   const calls: string[] = [];
   const bodies: (string | null)[] = [];
-  const forms: (FormData | null)[] = [];
   const original = globalThis.fetch;
 
   globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     calls.push(url);
-    const form = init?.body instanceof FormData ? init.body : null;
-    forms.push(form);
     bodies.push(
       typeof init?.body === 'string'
         ? init.body
         : init?.body instanceof URLSearchParams
           ? init.body.toString()
-          : form
-            ? String(form.get('payload_json'))
-            : null,
+          : null,
     );
     const rule = rules.find((r) => url.includes(r.match));
     if (!rule) throw new Error(`Unstubbed fetch to ${url}`);
@@ -106,7 +96,6 @@ export function stubFetch(rules: FetchRule[]): FetchStub {
   return {
     calls,
     bodies,
-    forms,
     restore: () => {
       globalThis.fetch = original;
     },
