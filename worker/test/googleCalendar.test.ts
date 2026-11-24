@@ -4,7 +4,7 @@ import { signJwt } from '../src/lib/jwt';
 import { createSession } from '../src/lib/sessions';
 import { signToken } from '../src/lib/signedToken';
 import { seal, unseal } from '../src/lib/crypto';
-import { GOOGLE_CONNECT_PURPOSE, insertCalendarEvent, storePendingConnection } from '../src/lib/googleCalendar';
+import { GOOGLE_CONNECT_PURPOSE, insertCalendarEvent, patchCalendarEvent, storePendingConnection } from '../src/lib/googleCalendar';
 import { sweepGoogleCalendar } from '../src/cron/googleSync';
 import { computeBusyBlocksForUsers } from '../src/lib/freeBusy';
 import { runReminderSweep } from '../src/cron/reminders';
@@ -1440,13 +1440,16 @@ describe('remote event creation reconciliation', () => {
         remote.set(key, body);
         return Response.json({ id: body.id });
       }
-      if (init?.method === 'PATCH') return Response.json(remote.get(url));
+      if (init?.method === 'PATCH') Object.assign(remote.get(url)!, body);
       return Response.json(remote.get(url));
     });
     try {
       const insert = (cal: string) => insertCalendarEvent('access', cal, payload, 'member', () => true);
       const first = await insert('primary');
       expect(first.ok).toBe(true);
+      if (!first.ok) throw new Error('expected a created event');
+      await patchCalendarEvent('access', 'primary', first.value.id, { ...payload, title: 'Updated' });
+      expect([...remote.values()][0].summary).toBe('Updated');
       expect(await insert('primary')).toMatchObject(first);
       expect(remote.size).toBe(1);
       expect((await insert('other'))).not.toEqual(first);

@@ -946,13 +946,6 @@ function eventBody(payload: CalendarEventPayload): Record<string, unknown> {
     description: lines.join('\n'),
     start: { dateTime: new Date(payload.startAt).toISOString() },
     end: { dateTime: new Date(payload.endAt).toISOString() },
-    // Private to this OAuth client, invisible to the user and to anything else
-    // reading the calendar. Makes an entry identifiable as ours from Google's
-    // side -- useful for support ("why is this here"), and the handle a future
-    // reconciliation pass would need if a link row is ever lost.
-    extendedProperties: {
-      private: { uncleOwenEventId: payload.eventId, uncleOwenOccurrence: payload.occurrenceDate },
-    },
   };
 }
 
