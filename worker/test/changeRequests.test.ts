@@ -21,6 +21,7 @@ import {
   ids,
   loadEventRow,
   membershipRule,
+  seedAttendance,
   seedEvent,
   seedGuild,
   seedInvite,
@@ -119,6 +120,10 @@ describe('filing a change request', () => {
     await seedUser(db, 'inv-a');
     await seedMembership(db, 'inv-a', 'guild-1');
     await seedInvite(db, 'ev1', 'inv-a');
+    await seedUser(db, 'declined');
+    await seedMembership(db, 'declined', 'guild-1');
+    await seedInvite(db, 'ev1', 'declined');
+    await seedAttendance(db, 'ev1', 'declined', 'declined');
     const event = await loadEventRow(db, 'ev1');
     const proposedStartAt = Date.now() + 10 * HOUR_MS;
     const proposedEndAt = Date.now() + 11 * HOUR_MS;
@@ -134,6 +139,12 @@ describe('filing a change request', () => {
     expect(request!.vote_threshold_count).toBeNull();
     expect(request!.vote_deadline_at).toBeNull();
     expect((await loadEventRow(db, 'ev1')).start_at).not.toBe(proposedStartAt);
+
+    await seedUser(db, 'late');
+    await seedMembership(db, 'late', 'guild-1');
+    await seedInvite(db, 'ev1', 'late');
+    await voteOnChangeRequest(env, event, request!, 'late', 'yes');
+    expect((await loadChangeRequest(env, 'ev1', id))!.status).toBe('pending');
 
     // The organizer's decision is what applies it.
     await acceptChangeRequest(env, event, request!, 'organizer');
@@ -556,6 +567,7 @@ describe('past-deadline vote resolution', () => {
 
     const decided2 = await loadChangeRequest(env, 'ev1', id2);
     expect(decided2!.status).toBe('declined'); // 1 yes vs 2 no
+    expect(decided2!.decision_note).toBeNull();
   });
 });
 
@@ -620,6 +632,10 @@ describe('an accepted request never brings back a date the organizer cancelled (
     await resolvePastDeadlineChangeRequests(env);
 
     expect((await loadChangeRequest(env, 'ev1', id))!.status).toBe('declined');
+    expect((await loadChangeRequest(env, 'ev1', id))!.decision_note).toBe('That occurrence was cancelled.');
+    fetchStub = stubFetch([DM_CHANNEL_RULE, dmSendRule(200), membershipRule(200)]);
+    await runReminderSweep(env);
+    expect(fetchStub.bodies.some(body => body?.includes('That occurrence was cancelled.'))).toBe(true);
     expect(await overrideFor(db)).toEqual({ is_cancelled: 1, override_start_at: null });
   });
 

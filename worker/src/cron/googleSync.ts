@@ -590,6 +590,7 @@ async function syncOneConnection(
     firstFailure ??= message;
   };
 
+  let cleanupReserved = false;
   for (const occ of desired) {
     const key = `${occ.eventId}::${occ.occurrenceDate}`;
     const existing = linkByKey.get(key);
@@ -731,7 +732,10 @@ async function syncOneConnection(
       continue;
     }
 
-    if (!budget.tryCalendarWrite()) {
+    // Reserve one D1 statement for recording a refused mapping. One is
+    // enough for the whole connection: a refusal ends this stale sync.
+    if (!cleanupReserved) cleanupReserved = budget.trySpend(1);
+    if (!cleanupReserved || !budget.tryCalendarWrite()) {
       outOfBudget = true;
       break;
     }
@@ -740,21 +744,31 @@ async function syncOneConnection(
       // A retry after interruption recovers the deterministic Google ID.
       // If the destination has changed or D1 rejects the mapping, retain
       // a cleanup obligation for the account that created the remote entry.
-      const owe = async (): Promise<void> => {
+      // A concurrent sync can recover the same remote ID using the new
+      // credential before this older attempt reaches its mapping write.
+      const alreadyMapped = `SELECT 1 FROM google_event_links l
+        JOIN google_calendar_connections c ON c.user_id = l.user_id
+        WHERE l.user_id = ? AND l.calendar_id = ? AND l.google_event_id = ?
+          AND LOWER(c.google_account_email) = LOWER(?)`;
+      const mappedBinds = [row.user_id, row.calendar_id, result.value.id, row.google_account_email];
+      const owe = async (): Promise<string | null> => {
         try {
-          await env.DB.prepare(
+          const id = newId();
+          const recorded = await env.DB.prepare(
             `INSERT INTO google_orphaned_inserts
                (id, user_id, google_event_id, calendar_id, created_at, google_account_email)
-             VALUES (?, ?, ?, ?, ?, ?)
+             SELECT ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (${alreadyMapped})
              ON CONFLICT(user_id, calendar_id, google_event_id) DO NOTHING`,
           )
-            .bind(newId(), row.user_id, result.value.id, row.calendar_id, now, row.google_account_email)
+            .bind(id, row.user_id, result.value.id, row.calendar_id, now, row.google_account_email, ...mappedBinds)
             .run();
+          return recorded.meta.changes ? id : null;
         } catch (err) {
           console.error(
             `Google sync for ${row.user_id}: created ${result.value.id} in Google and could not record the obligation to remove it`,
             err,
           );
+          return null;
         }
       };
 
@@ -817,29 +831,15 @@ async function syncOneConnection(
         throw err;
       }
 
-      // Pass-19 review (P19-08). The guard above refuses the mapping when the
-      // destination or credential moved while this insert was in flight -- and
-      // until now, that was the end of it. The event existed in the user's
-      // Google calendar and nothing local pointed at it, so the next sweep
-      // made a second copy, and DISCONNECT could not remove the first, because
-      // disconnect enumerates google_event_links. Three places in the product
-      // promise, without qualification, that disconnecting removes the
-      // upcoming entries this app added.
-      //
-      // So a refused mapping is now an obligation rather than a shrug. Try to
-      // undo the remote insert straight away, which also removes the duplicate
-      // that made this visible; if that cannot happen -- the delete fails, or
-      // the calendar-write allowance is spent -- record it so cleanup can.
-      //
-      // Note the delete targets `row.calendar_id`, the calendar this insert
-      // was actually dispatched to, not wherever the connection points now.
-      // That is the same lesson P13-08 taught the disconnect sweep.
       if (mapping.meta.changes === 0) {
-        const compensated =
-          budget.tryCalendarWrite() &&
-          (await deleteCalendarEvent(accessToken, row.calendar_id, result.value.id)).ok;
-        if (!compensated) await owe();
-        continue;
+        // Persist the obligation before cleanup. A concurrent mapping for
+        // this ID suppresses it and preserves the other sync's event.
+        const obligation = await owe();
+        if (obligation && budget.tryCalendarWrite()) {
+          const removed = await deleteCalendarEvent(accessToken, row.calendar_id, result.value.id);
+          if (removed.ok) await env.DB.prepare('DELETE FROM google_orphaned_inserts WHERE id = ?').bind(obligation).run();
+        }
+        return;
       }
 
       counts.inserted += 1;
