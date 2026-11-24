@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Link, Navigate } from 'react-router-dom';
+import { Navigate } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext';
 import { beginLogin } from '../auth/loginTransaction';
 import { buttonClass } from '../components/ui';
@@ -89,7 +89,8 @@ export default function LoginPage() {
 
         <p className="max-w-sm text-[#E0C9A8]">
           Log in with Discord to see the schedule for your servers and coordinate sessions with
-          your friends.
+          your friends. Optionally connect Google Calendar to sync sessions to a calendar you choose.
+          You can also import busy times from one calendar so friends see when you’re unavailable.
         </p>
 
         <button type="button" onClick={startLogin} className={buttonClass('primary', 'hero')}>
@@ -99,13 +100,13 @@ export default function LoginPage() {
 
         <p className="text-xs text-[#9A8067]">
           By logging in you agree to the{' '}
-          <Link to="/terms" className="underline hover:text-[#E0C9A8]">
+          <a href="/terms/" className="underline hover:text-[#E0C9A8]">
             Terms
-          </Link>{' '}
+          </a>{' '}
           and{' '}
-          <Link to="/privacy" className="underline hover:text-[#E0C9A8]">
+          <a href="/privacy/" className="underline hover:text-[#E0C9A8]">
             Privacy Policy
-          </Link>
+          </a>
           .
         </p>
       </div>

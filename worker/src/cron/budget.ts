@@ -244,6 +244,20 @@ export class TickBudget {
     );
   }
 
+  // Leave half this phase's remaining allowance for work that follows it.
+  async withHalfBudget(work: () => Promise<void>): Promise<void> {
+    const heldQueries = Math.floor(this.queries / 2);
+    const heldSubrequests = Math.floor(this.subrequests / 2);
+    this.queries -= heldQueries;
+    this.subrequests -= heldSubrequests;
+    try {
+      await work();
+    } finally {
+      this.queries += heldQueries;
+      this.subrequests += heldSubrequests;
+    }
+  }
+
   get exhausted(): boolean {
     return this.subrequests < COST_CACHED.subrequests || this.queries < COST_CACHED.queries;
   }

@@ -24,6 +24,9 @@ export interface PendingFor {
   notificationType: string;
   occurrenceDate: string;
   limit: number;
+  excludeUserId?: string;
+  recipientId?: string;
+  notificationEventId?: string;
 }
 
 // Same reasoning as reminders.ts's getEventParticipants: this runs inside the
@@ -58,7 +61,7 @@ export interface PendingFor {
 // The organizer is exempt by id, not assumed to hold an invite row. Idea 26
 // gives them one, but they are the event's owner either way and a missing row
 // must not silently stop their own event's DMs.
-function membershipJoin(idsSubquery: string): string {
+function membershipJoin(pending: PendingFor, idsSubquery: string): string {
   return `SELECT u.id, u.notifications_enabled, u.dm_channel_id, u.timezone
           FROM users u
           JOIN user_guild_membership m
@@ -70,6 +73,8 @@ function membershipJoin(idsSubquery: string): string {
               SELECT 1 FROM event_invites ei WHERE ei.event_id = ? AND ei.user_id = u.id
             ))
             AND ${PENDING_NOTIFICATION_WHERE}
+            ${pending.recipientId ? 'AND u.id = ?' : ''}
+            ${pending.excludeUserId ? 'AND u.id != ?' : ''}
           ORDER BY u.id
           LIMIT ?`;
 }
@@ -86,11 +91,13 @@ function attendeeBinds(
   return [
     event.guild_id,
     membershipCutoff(),
-    ...pendingNotificationJoinBinds(event.id, pending.notificationType, pending.occurrenceDate),
+    ...pendingNotificationJoinBinds(pending.notificationEventId ?? event.id, pending.notificationType, pending.occurrenceDate),
     ...subqueryBinds,
     event.organizer_id,
     event.id,
     ...pendingNotificationWhereBinds(),
+    ...(pending.recipientId ? [pending.recipientId] : []),
+    ...(pending.excludeUserId ? [pending.excludeUserId] : []),
     pending.limit,
   ];
 }
@@ -219,7 +226,7 @@ export async function getConfirmedAttendeeIds(
     // covering the resolved span is unambiguous either way.
     if (event.start_at == null || event.end_at == null) return [];
     const { results } = await env.DB.prepare(
-      membershipJoin(
+      membershipJoin(pending,
         `SELECT user_id FROM event_window_availability WHERE event_id = ? AND avail_start_at <= ? AND avail_end_at >= ?
          ${rsvpOverridesVote('event_window_availability')}
          ${RSVP_ACCEPTED}
@@ -248,7 +255,7 @@ export async function getConfirmedAttendeeIds(
   if (event.event_type === 'poll') {
     if (!optionId) return [];
     const { results } = await env.DB.prepare(
-      membershipJoin(
+      membershipJoin(pending,
         `SELECT user_id FROM event_poll_votes WHERE option_id = ? AND vote = 'yes'
          ${rsvpOverridesVote('event_poll_votes')}
          ${RSVP_ACCEPTED}
@@ -273,7 +280,7 @@ export async function getConfirmedAttendeeIds(
   }
 
   const { results } = await env.DB.prepare(
-    membershipJoin(
+    membershipJoin(pending,
       `SELECT user_id FROM event_attendance WHERE event_id = ? AND occurrence_date = ? AND rsvp_status = 'accepted'
        ${ORGANIZER_UNLESS_DECLINED}`,
     ),

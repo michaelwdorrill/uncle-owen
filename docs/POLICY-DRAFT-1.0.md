@@ -275,8 +275,7 @@ So that nothing happens to your plans without you knowing it can:
   you'd pressed "Delete my account". You'll be sent a Discord message two weeks
   and one week before (if Discord accepts messages from the bot). It is paused
   while you're organizing, or invited to and haven't declined, anything still
-  to come — which includes any repeating event that hasn't been cancelled, even
-  one whose dates have all passed.
+  to come — including a repeating event that still has a date to come.
 
 Messages are sent through Discord, and the service retries a failed delivery,
 but it cannot guarantee you receive one: Discord may refuse it if you block the
@@ -522,7 +521,7 @@ Every factual statement in Parts B and C, and where it is made true.
 | No admin page for events/answers/personal time | `routes/admin.ts` has only users, guilds, guild-requests | read |
 | Minimum attendees: optional deadline; auto-cancel at the deadline or on the decline that takes it below; otherwise the organizer is messaged | `lib/attendance.ts` `recordRsvp` (~`:523`); `sweepMinimumAttendeesDeadlines`; `sendCancelledEventNotice` — **draft 2, D-17** | walkthrough 4.x |
 | Poll day becomes an event; **every** answer carried (yes/no/maybe → accepted/declined/tentative); called off below threshold | `reminders.ts` `createFannedOutEvent`, `VOTE_AS_RSVP` (`lib/polls.ts`) — **draft 2, P24-02: only yes was carried, so an organizer's no showed as yes** | `confirmedDayThreshold.test.ts`; walkthrough 5.10–5.14 |
-| Inactivity deletion at 365 days; warnings at 351/358; paused while organizing/invited to future plans **or to any uncancelled repeating event**; warnings sent even with notifications off | `reminders.ts:3096`–`:3098`; stake query `start_at IS NULL OR start_at > ?` (`:3151`), and every series has `start_at IS NULL` — **draft 2, D-16** | read |
+| Inactivity deletion at 365 days, warnings at 351/358, paused while organizing or invited to future plans including future occurrences | `hasUpcomingStake` in `worker/src/cron/reminders.ts`, recurrence coverage in `worker/test/staleAccounts.test.ts` | verified locally |
 | Cancelled events / finished polls deleted 90 days after they were last changed; ordinary past events kept | `reminders.ts:193`; the purge keys on `updated_at` (`:3474`) — **draft 2, D-18** | read |
 | Deletion removes the listed data from the live database, immediately; organised events go for everyone; no cancellation DM; Google entries already written stay; recovery copies for the Time Travel window | `worker/src/lib/db.ts` `deleteUserCompletely` (one batch; every FK into `users` handled — verified by the Fable review); Google left at `db.ts:586`; F6 | walkthrough 6.6/6.7 |
 | Export: everything held about you except encrypted credentials | `worker/src/routes/me.ts` export; `worker/test/exportCompleteness.test.ts` checks every explicit projection against the schema — **draft 2, D-07** | download it; compare with Part E |

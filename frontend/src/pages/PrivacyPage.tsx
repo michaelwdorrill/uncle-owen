@@ -247,7 +247,7 @@ export default function PrivacyPage() {
           items={[
             'An organizer can set a minimum number of attendees, and either a deadline by which it must be met or none. If they switch on automatic cancellation, the event cancels itself — at the deadline, or as soon as someone’s “can’t make it” takes it below the minimum — and the service messages everyone still coming. Otherwise the organizer is messaged and decides.',
             'On a poll where each day is confirmed separately, a confirmed day becomes its own event, and your answer for that day — “I’m in”, “can’t make it” or “maybe” — carries over as your answer for it. If that day later falls below the number of people the poll needed, it is called off and the service messages everyone still coming.',
-            'An account that hasn’t logged in for 365 days is deleted, exactly as if you’d pressed “Delete my account”. The service sends a Discord message two weeks and one week before. It is paused while you’re organizing, or invited to and haven’t declined, anything still to come — which includes any repeating event that hasn’t been cancelled, even one whose dates have all passed.',
+            'An account that hasn’t logged in for 365 days is deleted, exactly as if you’d pressed “Delete my account”. The service sends a Discord message two weeks and one week before. It is paused while you’re organizing, or invited to and haven’t declined, anything still to come — including a repeating event that still has a date to come.',
           ]}
         />
         <p>

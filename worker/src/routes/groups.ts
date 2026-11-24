@@ -345,7 +345,7 @@ groupRoutes.delete('/:groupId/members/:userId', async (c) => {
   const targetUserId = c.req.param('userId');
   const group = await loadGroup(c.env, groupId, requesterId);
   if (!group) return c.text('Not found', 404);
-  if (group.created_by !== requesterId) return c.text('Forbidden', 403);
+  if (group.created_by !== requesterId && targetUserId !== requesterId) return c.text('Forbidden', 403);
 
   // The owner removing themselves is the one case that changes who owns the
   // group rather than just who's in it. Ownership moves to whoever has turned
@@ -359,8 +359,11 @@ groupRoutes.delete('/:groupId/members/:userId', async (c) => {
     return c.json({ ok: true, transferredTo: successorId });
   }
 
-  await c.env.DB.prepare(`DELETE FROM group_members WHERE group_id = ? AND user_id = ?`)
-    .bind(groupId, targetUserId)
+  const removal = await c.env.DB.prepare(`DELETE FROM group_members WHERE group_id = ? AND user_id = ?
+    AND EXISTS (SELECT 1 FROM groups WHERE id = group_members.group_id AND created_by != group_members.user_id
+      AND (created_by = ? OR group_members.user_id = ?))`)
+    .bind(groupId, targetUserId, requesterId, requesterId)
     .run();
+  if (!removal.meta.changes) return c.text('Membership changed. Refresh the group.', 409);
   return c.json({ ok: true });
 });

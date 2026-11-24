@@ -245,6 +245,8 @@ eventRoutes.get('/:eventId', async (c) => {
       c.env.DB.prepare(
         `SELECT ev.option_id, ev.vote, COUNT(*) AS n FROM event_poll_votes ev
          JOIN event_poll_options o ON o.id = ev.option_id
+         JOIN events parent ON parent.id = o.event_id AND (parent.organizer_id = ev.user_id OR EXISTS
+           (SELECT 1 FROM event_invites roster WHERE roster.event_id = o.event_id AND roster.user_id = ev.user_id))
          WHERE o.event_id = ? GROUP BY ev.option_id, ev.vote`,
       )
         .bind(eventId)
@@ -252,6 +254,8 @@ eventRoutes.get('/:eventId', async (c) => {
       c.env.DB.prepare(
         `SELECT ev.option_id, ev.vote FROM event_poll_votes ev
          JOIN event_poll_options o ON o.id = ev.option_id
+         JOIN events parent ON parent.id = o.event_id AND (parent.organizer_id = ev.user_id OR EXISTS
+           (SELECT 1 FROM event_invites roster WHERE roster.event_id = o.event_id AND roster.user_id = ev.user_id))
          WHERE o.event_id = ? AND ev.user_id = ?`,
       )
         .bind(eventId, userId)
@@ -266,6 +270,8 @@ eventRoutes.get('/:eventId', async (c) => {
       c.env.DB.prepare(
         `SELECT ev.option_id, ev.user_id, u.username, u.global_name FROM event_poll_votes ev
          JOIN event_poll_options o ON o.id = ev.option_id
+         JOIN events parent ON parent.id = o.event_id AND (parent.organizer_id = ev.user_id OR EXISTS
+           (SELECT 1 FROM event_invites roster WHERE roster.event_id = o.event_id AND roster.user_id = ev.user_id))
          JOIN users u ON u.id = ev.user_id
          WHERE o.event_id = ? AND o.confirmed_at IS NOT NULL AND ev.vote = 'yes'
            AND NOT EXISTS (SELECT 1 FROM events c WHERE c.created_from_option_id = o.id)
@@ -301,6 +307,8 @@ eventRoutes.get('/:eventId', async (c) => {
         `SELECT ev.option_id, ev.user_id, ev.vote, u.username, u.global_name, att.rsvp_status AS current_rsvp_status
          FROM event_poll_votes ev
          JOIN event_poll_options o ON o.id = ev.option_id
+         JOIN events parent ON parent.id = o.event_id AND (parent.organizer_id = ev.user_id OR EXISTS
+           (SELECT 1 FROM event_invites roster WHERE roster.event_id = o.event_id AND roster.user_id = ev.user_id))
          JOIN users u ON u.id = ev.user_id
          LEFT JOIN events c ON c.created_from_option_id = o.id
          LEFT JOIN event_attendance att ON att.event_id = COALESCE(c.id, o.event_id) AND att.occurrence_date = ''
@@ -487,6 +495,9 @@ eventRoutes.patch('/:eventId', async (c) => {
   if (!event) return c.text('Not found', 404);
 
   const body = await readJsonBody<Partial<EventWriteInput>>(c);
+  if (body.eventType !== undefined && body.title !== undefined && body.invites !== undefined && body.revision == null) {
+    return c.text('Reload the event before saving. The editor revision is missing.', 428);
+  }
   await updateEvent(c.env, eventId, event.guild_id, body, event);
   return c.json({ ok: true });
 });
@@ -497,7 +508,7 @@ eventRoutes.delete('/:eventId', async (c) => {
   const event = await loadOwnedActiveEvent(c.env, eventId, userId);
   if (!event) return c.text('Not found', 404);
 
-  await c.env.DB.prepare(`UPDATE events SET status = 'cancelled', updated_at = ? WHERE id = ?`)
+  await c.env.DB.prepare(`UPDATE events SET status = 'cancelled', cancelled_by_organizer = 1, updated_at = ? WHERE id = ? AND status != 'cancelled'`)
     .bind(Date.now(), eventId)
     .run();
   return c.json({ ok: true });

@@ -39,6 +39,11 @@ end. It also ranks the five steps to do first if time is short.
 
 ---
 
+## Before merging a release
+
+- [ ] Open the **production** Discord application in the Developer Portal. Under **OAuth2 → Redirects**, compare both registered URLs against SETUP section 1 and the deployed production Worker origin. Verify the exact scheme, host and paths `/auth/callback` and `/guild-requests/callback`. Sign-in exercises only the first.
+- The callbacks are derived from the request origin. Logging them on every login would not verify what Discord registered. Record the portal comparison in the release results.
+
 ## Prerequisites — read before starting, this is where it derails
 
 **The sandbox has its own Discord application.** It is a *different bot* from

@@ -1,3 +1,4 @@
+import type { SqlPredicate } from './d1';
 import type { Env } from '../env';
 import { chunkIds, placeholders } from './d1';
 import { newId } from './ids';
@@ -45,6 +46,7 @@ export interface EventRow {
   // specs/0014 stage 3. Optional for the same reason revision is: narrower
   // test fixtures and rows selected before migration 0027 will not carry
   // them.
+  cancelled_by_organizer?: number;
   minimum_attendees?: number | null;
   auto_cancel_below_minimum?: number;
   created_from_poll_id?: string | null;
@@ -320,6 +322,26 @@ export const OVERRIDE_ADMISSION_SQL = `(
 // move of an already-changed date is admitted at the cap. Resolves false when
 // admission refused it, or (restoreCancelled false) the date is cancelled; each
 // caller turns that into its own error.
+export function occurrenceMoveStatement(
+  env: Env,
+  eventId: string,
+  occurrenceDate: string,
+  startAt: number,
+  endAt: number,
+  { restoreCancelled }: { restoreCancelled: boolean },
+  predicate?: SqlPredicate,
+): D1PreparedStatement {
+  return env.DB.prepare(
+    `INSERT INTO event_occurrence_overrides (id, event_id, occurrence_date, is_cancelled, override_start_at, override_end_at)
+     SELECT ?, ?, ?, 0, ?, ?
+     WHERE (${OVERRIDE_ADMISSION_SQL}) ${predicate ? `AND (${predicate.sql})` : ''}
+     ON CONFLICT(event_id, occurrence_date) DO UPDATE SET
+       is_cancelled = 0, override_start_at = excluded.override_start_at, override_end_at = excluded.override_end_at
+     ${restoreCancelled ? '' : 'WHERE event_occurrence_overrides.is_cancelled = 0'}`,
+  )
+    .bind(newId(), eventId, occurrenceDate, startAt, endAt, eventId, occurrenceDate, eventId, ...(predicate?.binds ?? []));
+}
+
 export async function writeOccurrenceMove(
   env: Env,
   eventId: string,
@@ -328,15 +350,6 @@ export async function writeOccurrenceMove(
   endAt: number,
   { restoreCancelled }: { restoreCancelled: boolean },
 ): Promise<boolean> {
-  const written = await env.DB.prepare(
-    `INSERT INTO event_occurrence_overrides (id, event_id, occurrence_date, is_cancelled, override_start_at, override_end_at)
-     SELECT ?, ?, ?, 0, ?, ?
-     WHERE ${OVERRIDE_ADMISSION_SQL}
-     ON CONFLICT(event_id, occurrence_date) DO UPDATE SET
-       is_cancelled = 0, override_start_at = excluded.override_start_at, override_end_at = excluded.override_end_at
-     ${restoreCancelled ? '' : 'WHERE event_occurrence_overrides.is_cancelled = 0'}`,
-  )
-    .bind(newId(), eventId, occurrenceDate, startAt, endAt, eventId, occurrenceDate, eventId)
-    .run();
+  const written = await occurrenceMoveStatement(env, eventId, occurrenceDate, startAt, endAt, { restoreCancelled }).run();
   return written.meta.changes > 0;
 }

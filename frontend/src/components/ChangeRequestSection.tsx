@@ -197,7 +197,7 @@ export default function ChangeRequestSection({
   const [friends, setFriends] = useState<Friend[] | null>(null);
 
   if (!isInvitee && !isOrganizer) return null;
-  if (requests.length === 0 && !isInvitee) return null;
+  if (requests.length === 0 && (!isInvitee || event.status !== 'active')) return null;
 
   const myRequests = requests.filter((r) => r.requesterId === userId);
   // Voting is invitee-only (the spec: "every current invitee" votes; the
@@ -272,6 +272,9 @@ export default function ChangeRequestSection({
                 {r.proposedStartAt && r.proposedEndAt && formatTimeRange(r.proposedStartAt, r.proposedEndAt, event.timezone)}
                 {r.message && <span className="text-muted"> — “{r.message}”</span>}
               </p>
+              {r.voteThresholdCount == null && !r.dateCancelled && (
+                <p className="mt-1 text-xs text-muted">Your vote advises the organizer, who decides this request.</p>
+              )}
               {r.dateCancelled && (
                 <p className="mt-1 text-xs text-warning-text">That date has been cancelled, so there is nothing to vote on.</p>
               )}

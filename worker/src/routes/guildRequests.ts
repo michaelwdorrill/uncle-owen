@@ -15,8 +15,9 @@
 import { Hono } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import type { AppEnv } from '../lib/authMiddleware';
-import { botGuildPresence, canAdministerGuild, exchangeCodeForToken, fetchDiscordUser, fetchDiscordUserGuilds } from '../lib/discord';
-import { oauthCallbackAllowed } from '../lib/rateLimit';
+import { missingBotGuilds, botGuildPresence, canAdministerGuild, exchangeCodeForToken, fetchDiscordUser, fetchDiscordUserGuilds } from '../lib/discord';
+import { activeAllowListedGuildIds } from '../lib/db';
+import { oauthCallbackAllowed, oauthRetryPage } from '../lib/rateLimit';
 import {
   createGuildAddRequest,
   decideGuildAddRequest,
@@ -102,7 +103,8 @@ guildRequestRoutes.get('/callback', async (c) => {
   // Bound before the spend, same rule and same ordering as routes/auth.ts.
   if (!(await oauthCallbackAllowed(c.env, c.req.raw.headers))) {
     c.header('Cache-Control', NO_STORE);
-    return c.text('Too many attempts from this address. Please wait a minute and try again.', 429);
+    c.header('Retry-After', '60');
+    return c.html(oauthRetryPage(c.env.FRONTEND_URL + '/#/add-bot'), 429);
   }
 
   try {
@@ -136,13 +138,14 @@ guildRequestRoutes.get('/callback', async (c) => {
     // to someone looking straight at a server they run. Returning it flagged
     // rather than filtering it out lets the frontend say why it's not
     // requestable instead of just not showing it.
+    const activeIds = new Set(await activeAllowListedGuildIds(c.env, administered.map(g => g.id)));
+    const missing = activeIds.size > 8 ? await missingBotGuilds(c.env.DISCORD_BOT_TOKEN, activeIds) : null;
     const eligible = await Promise.all(
       administered.map(async (g) => {
-        const active = await c.env.DB.prepare(`SELECT 1 FROM guilds WHERE id = ? AND is_active = 1`).bind(g.id).first();
-        if (active) {
+        if (activeIds.has(g.id)) {
           // IDEAS 102 follow-up: allow-listed is not the same as the bot being
           // there. Already approved, so no new request -- just the invite.
-          if ((await botGuildPresence(c.env.DISCORD_BOT_TOKEN, g.id)) === 'absent') {
+          if (missing ? missing.has(g.id) : (await botGuildPresence(c.env.DISCORD_BOT_TOKEN, g.id)) === 'absent') {
             return { guildId: g.id, guildName: g.name, botMissing: true as const, botInviteUrl: botInviteUrl(c.env, g.id) };
           }
           return { guildId: g.id, guildName: g.name, alreadyAdded: true as const };

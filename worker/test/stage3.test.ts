@@ -530,6 +530,17 @@ describe('decision 3: attendance survives a schedule edit unless the local date 
     expect(await countRows(db, 'event_attendance', `event_id = 'e1' AND user_id = 'alice'`)).toBe(1);
   });
 
+  it.each([['2026-09-10', 1], ['2026-09-11', 0]] as const)('converts a one-off to a series starting %s', async (first, retained) => {
+    const { db, env } = setup();
+    await seedAnsweredEvent(db, Date.parse('2026-09-11T01:00:00Z'), 'America/New_York');
+    await updateEvent(env, 'e1', 'guild-1', {
+      isRecurring: true, recurrence: { freq: 'DAILY', interval: 1, byWeekday: null, byMonthDay: null,
+        startDate: first, startTime: '21:00', durationMinutes: 60, endType: 'never', endDate: null, endCount: null },
+    }, await loadEventRow(db, 'e1'));
+    expect(await countRows(db, 'event_attendance', "event_id = 'e1' AND user_id = 'alice' AND occurrence_date = ?", first)).toBe(retained);
+    expect(await countRows(db, 'event_attendance', "event_id = 'e1' AND occurrence_date = ''")).toBe(0);
+  });
+
   it('clears attendance when the edit moves the event to a different local day', async () => {
     const { db, env } = setup();
     const start = Date.parse('2026-09-10T22:00:00.000Z');
