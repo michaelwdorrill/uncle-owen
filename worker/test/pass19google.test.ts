@@ -138,6 +138,25 @@ describe('a Google event we created is never left untracked (P19-08)', () => {
     expect(owed!.n, 'compensation succeeded, so nothing should still be owed').toBe(0);
   });
 
+  it('keeps the recovered event if the current connection already mapped its deterministic ID', async () => {
+    const { db, env: base } = setup();
+    const env = googleEnv(base);
+    await seedSyncable(db);
+    const reconnect = reconnectDuringInsert(db);
+    fetchStub = stubFetch([TOKEN_RULE, {
+      ...reconnect, before: async () => {
+        await reconnect.before();
+        await db.prepare(`INSERT OR IGNORE INTO google_event_links
+          (id, user_id, event_id, occurrence_date, google_event_id, synced_at, calendar_id)
+          VALUES ('recovered', 'u1', 'evt-1', '', 'google-event-orphan', 1, 'primary')`).run();
+      },
+    }]);
+    await sweepGoogleCalendar(env, new TickBudget('paid'));
+    expect(fetchStub.calls.some((url, i) => url.includes('google-event-orphan') && fetchStub!.bodies[i] === null)).toBe(false);
+    expect(await db.prepare("SELECT id FROM google_event_links WHERE id = 'recovered'").first()).toBeTruthy();
+    expect(await db.prepare("SELECT id FROM google_orphaned_inserts").first()).toBeNull();
+  });
+
   it('records the obligation when the compensating delete fails, and disconnect honours it', async () => {
     const { db, env: base } = setup();
     const env = googleEnv(base);

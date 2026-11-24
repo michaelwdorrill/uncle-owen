@@ -199,15 +199,16 @@ export default function ChangeRequestSection({
   if (!isInvitee && !isOrganizer) return null;
   if (requests.length === 0 && (!isInvitee || event.status !== 'active')) return null;
 
-  const myRequests = requests.filter((r) => r.requesterId === userId);
+  const cancelled = event.status === 'cancelled';
+  const history = cancelled ? requests : requests.filter((r) => r.requesterId === userId);
   // Voting is invitee-only (the spec: "every current invitee" votes; the
   // organizer has Accept/Decline instead) -- gated on isInvitee, not merely
   // "not the requester", so the organizer never sees vote buttons on their
   // own event even though the GET response includes this row for them too.
-  const votable = isInvitee
+  const votable = isInvitee && !cancelled
     ? requests.filter((r) => r.kind === 'time_change' && r.status === 'pending' && r.requesterId !== userId)
     : [];
-  const organizerPending = isOrganizer ? requests.filter((r) => r.status === 'pending') : [];
+  const organizerPending = isOrganizer && !cancelled ? requests.filter((r) => r.status === 'pending') : [];
 
   const openInviteForm = async () => {
     if (!friends) setFriends(await loadFriends());
@@ -297,10 +298,10 @@ export default function ChangeRequestSection({
         </div>
       )}
 
-      {myRequests.length > 0 && (
+      {history.length > 0 && (
         <div className="space-y-2">
-          <h3 className="text-sm font-medium text-ink-dim">My requests</h3>
-          {myRequests.map((r) => (
+          <h3 className="text-sm font-medium text-ink-dim">{cancelled ? 'Request history' : 'My requests'}</h3>
+          {history.map((r) => (
             <div key={r.id} className="flex items-start justify-between rounded-md border border-edge p-2 text-sm">
               <div>
                 <p>
@@ -311,12 +312,13 @@ export default function ChangeRequestSection({
                     : `Invite ${r.targetGlobalName ?? r.targetUsername ?? 'someone'}`}
                 </p>
                 <p className="text-xs text-faint">
-                  {r.status}
+                  {cancelled && `${requesterName(r)} · `}
+                  {cancelled && r.status === 'pending' ? 'Pending when cancelled' : r.status}
                   {r.kind === 'time_change' && r.tally && r.status === 'pending' && <> — <Tally tally={r.tally} /></>}
                   {r.decisionNote && ` — ${r.decisionNote}`}
                 </p>
               </div>
-              {r.status === 'pending' && (
+              {!cancelled && r.status === 'pending' && (
                 <button onClick={() => onWithdraw(r.id)} className="text-xs text-muted hover:text-danger-text">
                   Withdraw
                 </button>
