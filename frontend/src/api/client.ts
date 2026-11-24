@@ -1,4 +1,4 @@
-import { authEpoch, getToken, setToken, clearToken } from '../auth/tokenStorage';
+import { authEpoch, readSession, refreshSession, clearToken } from '../auth/tokenStorage';
 
 // Set at build time via GitHub Actions (VITE_API_BASE_URL repo variable);
 // falls back to a placeholder for local dev against `wrangler dev`.
@@ -18,7 +18,7 @@ export class ApiError extends Error {
 // authority lives server-side and can be revoked instantly). Concurrent
 // requests that all hit a stale token share one in-flight refresh instead of
 // each racing their own.
-let refreshPromise: Promise<boolean> | null = null;
+const refreshing = new Map<string | null, Promise<boolean>>();
 
 // Pass-13 review (P13-06). `false` from tryRefresh used to mean two different
 // things -- "this authentication is dead" and "this work belongs to an
@@ -32,7 +32,7 @@ let refreshPromise: Promise<boolean> | null = null;
 // epoch it started in against the one it returns to. That also covers a
 // request that attached to an in-flight refresh belonging to a previous
 // epoch, which a return value from tryRefresh alone could not.
-async function tryRefresh(): Promise<boolean> {
+async function tryRefresh(startedAt: string | null, token: string | null): Promise<boolean> {
   // Pass-12 review (P12-05). The epoch this refresh belongs to, captured
   // before the await, so a response that arrives after the user has logged out
   // -- or logged in as someone else -- can be recognised as belonging to an
@@ -43,8 +43,6 @@ async function tryRefresh(): Promise<boolean> {
   // covered it: the session being revoked was this successor's predecessor.
   // Rotation is what made the successor outlive it, so the two halves of
   // P12-04 and this fix belong together.
-  const startedAt = authEpoch();
-  const token = getToken();
   if (!token) return false;
   try {
     const res = await fetch(`${API_BASE_URL}/auth/refresh`, {
@@ -53,41 +51,42 @@ async function tryRefresh(): Promise<boolean> {
     });
     if (!res.ok) return false;
     const { token: newToken } = (await res.json()) as { token: string };
-    if (authEpoch() !== startedAt) return false;
-    setToken(newToken);
-    return true;
+    return await refreshSession(startedAt, newToken);
   } catch {
     return false;
   }
 }
 
-function bounceToLogin(): never {
-  clearToken();
+async function bounceToLogin(epoch: string | null): Promise<never> {
+  if (!(await clearToken(epoch)).cleared) throw new ApiError(401, 'That session has ended.');
   window.location.hash = '#/login';
   throw new ApiError(401, 'Session expired, please log in again.');
 }
 
-async function request<T>(path: string, init: RequestInit = {}, isRetry = false): Promise<T> {
-  const startedEpoch = authEpoch();
-  const token = getToken();
+async function request<T>(path: string, init: RequestInit = {}, retryIdentity?: { epoch: string | null }): Promise<T> {
+  const { epoch: startedEpoch, token } = await readSession();
+  if (retryIdentity && retryIdentity.epoch !== startedEpoch) throw new ApiError(401, 'That session has ended.');
   const headers = new Headers(init.headers);
   headers.set('Content-Type', 'application/json');
   if (token) headers.set('Authorization', `Bearer ${token}`);
 
   const res = await fetch(`${API_BASE_URL}${path}`, { ...init, headers });
 
-  if (res.status === 401 && !isRetry && path !== '/auth/refresh') {
-    refreshPromise ??= tryRefresh().finally(() => {
-      refreshPromise = null;
-    });
-    const refreshed = await refreshPromise;
+  if (res.status === 401 && !retryIdentity && path !== '/auth/refresh') {
+    if (authEpoch() !== startedEpoch) throw new ApiError(401, 'That session has ended.');
+    let pending = refreshing.get(startedEpoch);
+    if (!pending) {
+      pending = tryRefresh(startedEpoch, token).finally(() => refreshing.delete(startedEpoch));
+      refreshing.set(startedEpoch, pending);
+    }
+    const refreshed = await pending;
     // Whoever is logged in now is not who this request was for. Fail it, and
     // leave their session completely alone -- no token clearing, no redirect.
     if (authEpoch() !== startedEpoch) {
       throw new ApiError(401, 'That session has ended.');
     }
-    if (refreshed) return request<T>(path, init, true);
-    bounceToLogin();
+    if (refreshed) return request<T>(path, init, { epoch: startedEpoch });
+    return bounceToLogin(startedEpoch);
   }
 
   // Pass-14 review (P14-04). The same identity check as the branch above, on
@@ -102,9 +101,10 @@ async function request<T>(path: string, init: RequestInit = {}, isRetry = false)
   // without touching whoever is signed in now.
   if (res.status === 401) {
     if (authEpoch() !== startedEpoch) throw new ApiError(401, 'That session has ended.');
-    bounceToLogin();
+    return bounceToLogin(startedEpoch);
   }
 
+  if (authEpoch() !== startedEpoch) throw new ApiError(401, 'That session has ended.');
   if (!res.ok) {
     const body = await res.text();
     throw new ApiError(res.status, body || res.statusText);

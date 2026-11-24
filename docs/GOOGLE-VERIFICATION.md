@@ -5,7 +5,7 @@ Google calendar meets. Only Google's verification does that. Both scopes are
 **sensitive**, not restricted: a review of the app and its documentation, with
 no fee and no third-party security assessment.
 
-## Where we stand (9 Nov 2026, after the 1.0 launch)
+## Where we stand (24 Nov 2026)
 
 | Requirement | Status |
 |---|---|
@@ -14,8 +14,8 @@ no fee and no third-party security assessment.
 | Branding verified and published; support email JediParty@proton.me | ✅ |
 | Privacy Policy discloses Google data use, with the Limited Use statement in Google's wording | ✅ policy v6 (`frontend/src/pages/PrivacyPage.tsx`) |
 | Home page linked to the Privacy Policy | ✅ (login page, Terms + Privacy links) |
-| **Home page explains what the app does, including its Google use** | ❌ 1.0.1, code (A below) |
-| **Privacy Policy and Terms at plain URLs** (no `#`), readable by Google's crawler | ❌ 1.0.1, code (B below) |
+| **Home page explains what the app does, including its Google use** | Built and checked in Chromium. Production release pending. |
+| **Privacy Policy and Terms at plain URLs** (no `#`), readable by Google's crawler | Built and checked with JavaScript disabled. Production release and consent URL update pending. |
 | Scope justifications | ✍️ drafted below, for Michael to adjust |
 | Demo video | 🎬 shot list below, for Michael to record |
 | Submission in Google Auth Platform → Verification Center | ⏳ after A and B ship |

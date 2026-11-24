@@ -13,6 +13,14 @@ import { DELETE_ACCOUNT_CONFIRMATION } from '../lib/deleteAccount';
 
 export default function SettingsPage() {
   const { user, refreshUser, logout } = useAuth();
+  const [light, setLight] = useState(() => document.documentElement.dataset.theme === 'light');
+  const changeTheme = (enabled: boolean) => {
+    const theme = enabled ? 'light' : 'dark';
+    document.documentElement.dataset.theme = theme;
+    document.querySelector('meta[name=theme-color]')?.setAttribute('content', enabled ? '#EFE3CC' : '#1A1410');
+    try { localStorage.setItem('uo.theme', theme); } catch { /* Applies for the current page. */ }
+    setLight(enabled);
+  };
   const [scenery, setSceneryState] = useState<Scenery>(getScenery);
   const [timezone, setTimezone] = useState(user?.timezone ?? 'America/New_York');
   const [notificationsEnabled, setNotificationsEnabled] = useState(
@@ -68,7 +76,7 @@ export default function SettingsPage() {
       // The account (and every session with it) is already gone server-side,
       // so there's nothing left to revoke -- clearing the token first is what
       // makes logout() skip the revocation it would otherwise queue.
-      clearToken();
+      await clearToken();
       await logout();
       window.location.hash = '#/login';
     } finally {
@@ -125,7 +133,12 @@ export default function SettingsPage() {
       </div>
 
       <div className={cardClass('md', 'space-y-3')}>
-        <h2 className="font-semibold">Scenery</h2>
+        <h2 className="font-semibold">Appearance</h2>
+        <label className="flex items-center gap-2 text-sm text-ink">
+          <input type="checkbox" checked={light} onChange={event => changeTheme(event.target.checked)} />
+          Light theme
+        </label>
+        <h3 className="font-semibold">Scenery</h3>
         <p className="text-sm text-muted">
           How much desert the app carries. Colours, type and layout are the same either way
           &mdash; this only adds or removes the scenery.

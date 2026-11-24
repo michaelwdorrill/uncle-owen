@@ -73,7 +73,7 @@ export default function PolicyGatePage() {
     setDeleting(true);
     try {
       await api.delete('/me');
-      clearToken();
+      await clearToken();
       await logout();
       window.location.hash = '#/login';
     } catch (e) {

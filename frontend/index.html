@@ -24,6 +24,10 @@
       (function () {
         var v = 'homestead';
         try {
+          if (localStorage.getItem('uo.theme') === 'light') {
+            document.documentElement.dataset.theme = 'light';
+            document.querySelector('meta[name=theme-color]').content = '#EFE3CC';
+          }
           var s = localStorage.getItem('uo.scenery');
           v =
             s === 'twin-suns' || s === 'homestead'
