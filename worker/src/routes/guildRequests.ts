@@ -15,7 +15,7 @@
 import { Hono } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import type { AppEnv } from '../lib/authMiddleware';
-import { botGuildPresence, canAdministerGuild, exchangeCodeForToken, fetchDiscordUser, fetchDiscordUserGuilds } from '../lib/discord';
+import { missingBotGuilds, botGuildPresence, canAdministerGuild, exchangeCodeForToken, fetchDiscordUser, fetchDiscordUserGuilds } from '../lib/discord';
 import { activeAllowListedGuildIds } from '../lib/db';
 import { oauthCallbackAllowed, oauthRetryPage } from '../lib/rateLimit';
 import {
@@ -139,12 +139,13 @@ guildRequestRoutes.get('/callback', async (c) => {
     // rather than filtering it out lets the frontend say why it's not
     // requestable instead of just not showing it.
     const activeIds = new Set(await activeAllowListedGuildIds(c.env, administered.map(g => g.id)));
+    const missing = activeIds.size > 8 ? await missingBotGuilds(c.env.DISCORD_BOT_TOKEN, activeIds) : null;
     const eligible = await Promise.all(
       administered.map(async (g) => {
         if (activeIds.has(g.id)) {
           // IDEAS 102 follow-up: allow-listed is not the same as the bot being
           // there. Already approved, so no new request -- just the invite.
-          if ((await botGuildPresence(c.env.DISCORD_BOT_TOKEN, g.id)) === 'absent') {
+          if (missing ? missing.has(g.id) : (await botGuildPresence(c.env.DISCORD_BOT_TOKEN, g.id)) === 'absent') {
             return { guildId: g.id, guildName: g.name, botMissing: true as const, botInviteUrl: botInviteUrl(c.env, g.id) };
           }
           return { guildId: g.id, guildName: g.name, alreadyAdded: true as const };

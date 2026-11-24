@@ -167,9 +167,11 @@ export async function createChangeRequest(
     // resolution and were counted. Idea 26 gives every organizer a row, which
     // would have made it uniformly wrong instead of intermittently.
     const countRow = await env.DB.prepare(
-      `SELECT COUNT(*) AS n FROM event_invites WHERE event_id = ? AND user_id != ?`,
+      `SELECT COUNT(*) AS n FROM event_invites i WHERE event_id = ? AND user_id != ?
+         AND NOT EXISTS (SELECT 1 FROM event_attendance a WHERE a.event_id = i.event_id
+           AND a.user_id = i.user_id AND a.occurrence_date = ? AND a.rsvp_status = 'declined')`,
     )
-      .bind(event.id, event.organizer_id)
+      .bind(event.id, event.organizer_id, input.occurrenceDate ?? '')
       .first<{ n: number }>();
     inviteeCount = countRow?.n ?? 0;
   } else {

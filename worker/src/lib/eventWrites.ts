@@ -1220,7 +1220,15 @@ export async function buildEventUpdate(
   predicate?: SqlPredicate,
 ) {
   input = normalizeWindowInput(input);
-  validateEventWriteInput(input);
+  const blockMinutes = input.windowBlockMinutes !== undefined ? input.windowBlockMinutes : stored.window_block_minutes;
+  validateEventWriteInput(input.pollOptions ? { ...input, windowBlockMinutes: blockMinutes } : input);
+  if (stored.event_type === 'poll' && input.windowBlockMinutes !== undefined && !input.pollOptions) {
+    const invalid = await env.DB.prepare(
+      `SELECT 1 FROM event_poll_options WHERE event_id = ? AND (end_at - start_at < ? OR end_at - start_at > ?) LIMIT 1`,
+    ).bind(eventId, (blockMinutes ?? 0) * 60_000,
+      blockMinutes == null ? LIMITS.MAX_EVENT_DURATION_MS : LIMITS.MAX_WINDOW_SPAN_MS).first();
+    if (invalid) throw new ValidationError('The existing candidates do not fit the requested session length');
+  }
   assertCoherentMergedEvent(stored, input);
   const now = Date.now();
   const wasRecurring = !!stored.is_recurring;
@@ -1301,6 +1309,17 @@ export async function buildEventUpdate(
   // realises a session is more private than they thought must be able to take
   // it off the noticeboard, and hiding something is exactly the direction that
   // should never require deleting and recreating it.
+  if (!input.pollOptions) {
+    for (const [column, value] of [
+      ['poll_strategy', input.pollStrategy], ['poll_threshold_count', input.pollThresholdCount],
+      ['poll_deadline_at', input.pollDeadlineAt], ['poll_resolution_mode', input.pollResolutionMode],
+    ] as const) {
+      if (value !== undefined) {
+        setClauses.push(column + ' = ?');
+        values.push(value);
+      }
+    }
+  }
   if (input.isPrivate !== undefined) {
     setClauses.push('is_private = ?');
     values.push(input.isPrivate ? 1 : 0);
@@ -1406,6 +1425,12 @@ export async function buildEventUpdate(
   const mergedPollStrategy = input.pollStrategy !== undefined ? input.pollStrategy : stored.poll_strategy;
   const mergedThresholdCount =
     input.pollThresholdCount !== undefined ? input.pollThresholdCount : stored.poll_threshold_count;
+  if (mergedPollStrategy === 'threshold' && mergedThresholdCount == null) {
+    throw new ValidationError('pollThresholdCount is required when pollStrategy is threshold');
+  }
+  if (stored.event_type === 'poll' && input.pollDeadlineAt === null) {
+    throw new ValidationError('pollDeadlineAt is required for a poll');
+  }
   if (mergedPollStrategy === 'threshold' && mergedThresholdCount != null) {
     const inviteeCount =
       invitees !== null
@@ -1446,7 +1471,20 @@ export async function buildEventUpdate(
   const guardedStatement = (sql: string, ...binds: unknown[]): D1PreparedStatement =>
     env.DB.prepare(`${sql}${siblingGuard}`).bind(...binds, ...guardBinds);
 
-  if (clearsAttendanceOnDateMove) {
+  if (convertingToRecurring && input.recurrence) {
+    // Answers belong to the date the invitee saw. Discard any obsolete keys
+    // from an earlier series before moving a matching one-off answer.
+    statements.push(guardedStatement(`DELETE FROM event_attendance WHERE event_id = ? AND occurrence_date != ''`, eventId));
+    const originalDate = stored.start_at == null ? null : localDateKey(stored.start_at, stored.timezone);
+    if (originalDate === input.recurrence.startDate) {
+      statements.push(guardedStatement(
+        `UPDATE event_attendance SET occurrence_date = ? WHERE event_id = ? AND occurrence_date = ''`,
+        originalDate, eventId,
+      ));
+    } else {
+      statements.push(guardedStatement(`DELETE FROM event_attendance WHERE event_id = ? AND occurrence_date = ''`, eventId));
+    }
+  } else if (clearsAttendanceOnDateMove) {
     statements.push(
       guardedStatement(`DELETE FROM event_attendance WHERE event_id = ? AND occurrence_date = ''`, eventId),
     );

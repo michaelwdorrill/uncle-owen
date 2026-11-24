@@ -134,6 +134,18 @@ describe('a confirmed multi-winner day that drops below its threshold (IDEAS 97)
     expect(await isConfirmed(db, optionId)).toBe(true);
   });
 
+  it('withdraws confirmation between deadline settlement and fan-out', async () => {
+    const { db, env } = setup();
+    const { pollId, optionId } = await seedPoll(db, env, { threshold: 2, invitees: ['invitee'] });
+    await vote(env, pollId, optionId, 'organizer', 'yes');
+    await vote(env, pollId, optionId, 'invitee', 'yes');
+    await db.prepare("UPDATE events SET status = 'resolved' WHERE id = ?").bind(pollId).run();
+    expect((await vote(env, pollId, optionId, 'invitee', 'no')).status).toBe(200);
+    expect(await isConfirmed(db, optionId)).toBe(false);
+    await runReminderSweep(env);
+    expect(await db.prepare('SELECT id FROM events WHERE created_from_option_id = ?').bind(optionId).first()).toBeNull();
+  });
+
   it('gives the day its threshold as a minimum, and counts the people who said yes', async () => {
     const { db, env } = setup();
     const { pollId, optionId } = await seedPoll(db, env, { threshold: 2, invitees: ['invitee', 'other'] });

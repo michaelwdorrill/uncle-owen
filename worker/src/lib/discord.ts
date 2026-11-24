@@ -80,6 +80,29 @@ export async function fetchGuildVoiceChannels(botToken: string, guildId: string)
 // GET /guilds/{id} answers 200 only for a server the bot is in; 404 Unknown
 // Guild or 403 means it is not. Anything else is `unknown`, and the caller
 // keeps its old answer: a Discord hiccup is not evidence the bot left.
+// Large rosters share a paged bot-guild lookup. Only a complete list can
+// establish absence. A bounded or failed lookup leaves other labels unknown.
+export async function missingBotGuilds(botToken: string, requested: Set<string>): Promise<Set<string>> {
+  const unseen = new Set(requested);
+  let after = '';
+  for (let page = 0; page < 10 && unseen.size; page++) {
+    const url = new URL(API_BASE + '/users/@me/guilds');
+    url.searchParams.set('limit', '200');
+    if (after) url.searchParams.set('after', after);
+    try {
+      const response = await fetch(url.toString(), { headers: { Authorization: 'Bot ' + botToken } });
+      if (!response.ok) break;
+      const guilds = await response.json() as { id: string }[];
+      for (const guild of guilds) unseen.delete(guild.id);
+      if (guilds.length < 200) return unseen;
+      after = guilds[guilds.length - 1].id;
+    } catch {
+      break;
+    }
+  }
+  return new Set();
+}
+
 export async function botGuildPresence(botToken: string, guildId: string): Promise<'present' | 'absent' | 'unknown'> {
   try {
     const res = await fetch(`${API_BASE}/guilds/${guildId}`, { headers: { Authorization: `Bot ${botToken}` } });

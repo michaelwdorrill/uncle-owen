@@ -336,8 +336,10 @@ const RSVP_ANSWER: Record<RsvpStatus, string> = {
   declined: "you can't make it.",
 };
 
-function siteLink(env: Env): string {
-  return `Open it on the site: ${env.FRONTEND_URL}`;
+function siteLink(env: Env, eventId?: string, occurrenceDate?: string): string {
+  const page = eventId ? '/#/events/' + encodeURIComponent(eventId) : '';
+  const date = occurrenceDate ? '?occurrence=' + encodeURIComponent(occurrenceDate) : '';
+  return `Open it on the site: ${env.FRONTEND_URL.replace(/\/$/, '')}${page}${date}`;
 }
 
 // users.id *is* the Discord user id (migrations/0001, written from
@@ -397,14 +399,10 @@ async function handleComponent(env: Env, interaction: Interaction): Promise<Inte
     // specs/0014 stage 3: the minimum-attendees cascade can cancel an event
     // between when this DM was sent and when someone presses it.
     if (outcome === 'event_not_active') {
-      return ephemeral(`That session isn't happening any more. ${siteLink(env)}`);
+      return ephemeral(`That session isn't happening any more. ${siteLink(env, parsed.eventId, parsed.occurrenceDate)}`);
     }
-    // Defensive: unreachable from a bot-authored button, since every id we
-    // ever emit pairs a real occurrence date with the event's own
-    // is_recurring. A genuine mismatch here means the message itself is
-    // corrupted rather than merely out of date.
     if (outcome === 'invalid_occurrence') {
-      return ephemeral(`That control looks corrupted. ${siteLink(env)}`);
+      return ephemeral(`The schedule has changed. Open the event and choose the date you want to answer. ${siteLink(env, parsed.eventId)}`);
     }
     return updateMessage(
       original,
@@ -441,7 +439,7 @@ async function handleComponent(env: Env, interaction: Interaction): Promise<Inte
       return ephemeral(`You're no longer in that server, so you can't change this one. ${siteLink(env)}`);
     }
     if (event.status !== 'active') {
-      return ephemeral(`That session isn't active any more. ${siteLink(env)}`);
+      return ephemeral(`That session isn't active any more. ${siteLink(env, parsed.eventId)}`);
     }
     // Pass-21 review (P21-04). Authority was re-derived correctly here and
     // SCOPE was not. This button says "Cancel this session" and is only ever
@@ -464,7 +462,7 @@ async function handleComponent(env: Env, interaction: Interaction): Promise<Inte
     // cancel this event now actually needs.
     if (event.is_recurring) {
       return ephemeral(
-        `This is a repeating event now, so this button can't cancel it -- it would take every date with it. Cancel a single date, or the whole series, on the site. ${siteLink(env)}`,
+        `This is a repeating event now, so this button can't cancel it -- it would take every date with it. Cancel a single date, or the whole series, on the site. ${siteLink(env, parsed.eventId)}`,
       );
     }
     // Pass-22 acceptance review noted the response could still say "cancelled"
@@ -474,14 +472,14 @@ async function handleComponent(env: Env, interaction: Interaction): Promise<Inte
     // gate; but telling someone their session is cancelled when it is not is
     // its own small harm, and the affected-row count already knows.
     const cancelled = await env.DB.prepare(
-      `UPDATE events SET status = 'cancelled', updated_at = ?
+      `UPDATE events SET status = 'cancelled', cancelled_by_organizer = 1, updated_at = ?
        WHERE id = ? AND organizer_id = ? AND status = 'active' AND is_recurring = 0`,
     )
       .bind(Date.now(), parsed.eventId, userId)
       .run();
     if (cancelled.meta.changes === 0) {
       return ephemeral(
-        `That session changed while you were pressing this, so nothing was cancelled. Take a look on the site. ${siteLink(env)}`,
+        `That session changed while you were pressing this, so nothing was cancelled. Take a look on the site. ${siteLink(env, parsed.eventId)}`,
       );
     }
     // No components after -- a fired cancel button must not be pressable
@@ -509,7 +507,7 @@ async function handleComponent(env: Env, interaction: Interaction): Promise<Inte
     // The series itself has to still be active; an individual occurrence's
     // own cancelled-ness lives in event_occurrence_overrides; see below.
     if (event.status !== 'active' || !event.is_recurring) {
-      return ephemeral(`That session isn't active any more. ${siteLink(env)}`);
+      return ephemeral(`That session isn't active any more. ${siteLink(env, parsed.eventId)}`);
     }
     // Same primitive POST /events/:eventId/occurrences/:date/cancel already
     // uses -- one occurrence, not the whole series.
@@ -528,7 +526,7 @@ async function handleComponent(env: Env, interaction: Interaction): Promise<Inte
     if (written.meta.changes === 0) {
       return ephemeral(
         `This event has reached its limit of ${LIMITS.MAX_OVERRIDES_PER_EVENT} changed occurrences, so this one ` +
-          `could not be cancelled here. ${siteLink(env)}`,
+          `could not be cancelled here. ${siteLink(env, parsed.eventId, parsed.occurrenceDate)}`,
       );
     }
     return updateMessage(original, 'this session is cancelled.', []);
@@ -540,9 +538,9 @@ async function handleComponent(env: Env, interaction: Interaction): Promise<Inte
     case 'no_such_poll':
       return ephemeral(`That poll no longer exists. ${siteLink(env)}`);
     case 'invalid_option':
-      return ephemeral(`Those options aren't on that poll any more. ${siteLink(env)}`);
+      return ephemeral(`Those options aren't on that poll any more. ${siteLink(env, parsed.eventId)}`);
     case 'closed':
-      return ephemeral(`${outcome.reason}. ${siteLink(env)}`);
+      return ephemeral(`${outcome.reason}. ${siteLink(env, parsed.eventId)}`);
     case 'forbidden':
       return ephemeral(`You're not on the invite list for that one any more. ${siteLink(env)}`);
   }

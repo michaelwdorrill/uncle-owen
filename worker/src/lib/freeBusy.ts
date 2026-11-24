@@ -331,15 +331,19 @@ async function loadConfirmedYesVotesForEvents(
       // option kept marking them BUSY at the old time after they had moved or
       // declined the real session. The child event's own attendance is the
       // answer once the child exists.
-      `SELECT o.event_id, v.user_id, o.start_at, o.end_at
-       FROM event_poll_options o
-       JOIN event_poll_votes v ON v.option_id = o.id
-       WHERE o.event_id IN (${placeholders(chunk.length)}) AND o.confirmed_at IS NOT NULL AND v.vote = 'yes'
-         AND v.user_id IN (${placeholders(userIds.length)})
+      `WITH requested(user_id) AS (VALUES ${userIds.map(() => '(?)').join(', ')})
+       SELECT o.event_id, r.user_id, o.start_at, o.end_at
+       FROM event_poll_options o JOIN events p ON p.id = o.event_id CROSS JOIN requested r
+       WHERE o.event_id IN (${placeholders(chunk.length)}) AND o.confirmed_at IS NOT NULL
          AND o.start_at <= ? AND o.end_at >= ?
-         AND NOT EXISTS (SELECT 1 FROM events c WHERE c.created_from_option_id = o.id)`,
+         AND NOT EXISTS (SELECT 1 FROM events c WHERE c.created_from_option_id = o.id)
+         AND ((p.window_block_minutes IS NULL AND EXISTS (
+           SELECT 1 FROM event_poll_votes v WHERE v.option_id = o.id AND v.user_id = r.user_id AND v.vote = 'yes'))
+           OR (p.window_block_minutes IS NOT NULL AND EXISTS (
+           SELECT 1 FROM event_window_availability a WHERE a.option_id = o.id AND a.user_id = r.user_id
+             AND a.avail_start_at <= o.start_at AND a.avail_end_at >= o.end_at)))`,
     )
-      .bind(...chunk, ...userIds, toMs, fromMs)
+      .bind(...userIds, ...chunk, toMs, fromMs)
       .all<ConfirmedVoteRow>();
     for (const row of results) {
       if (!map.has(row.event_id)) map.set(row.event_id, []);

@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { MemoryRouter } from 'react-router-dom';
+import { StaticRouter } from 'react-router-dom';
 import { createServer } from 'vite';
 
 // Render the same legal components as the app so policy text has one source.
@@ -14,7 +14,7 @@ try {
     ['terms', 'TermsPage', 'Terms of Service'],
   ]) {
     const { default: Page } = await server.ssrLoadModule('/src/pages/' + component + '.tsx');
-    const body = renderToStaticMarkup(createElement(MemoryRouter, { initialEntries: ['/' + path] }, createElement(Page)));
+    const body = renderToStaticMarkup(createElement(StaticRouter, { location: '/' + path }, createElement(Page)));
     await mkdir('dist/' + path, { recursive: true });
     await writeFile('dist/' + path + '/index.html', `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">

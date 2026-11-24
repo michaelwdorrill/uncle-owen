@@ -1297,6 +1297,16 @@ describe('a queued DM does not outlive the access that justified it (R09)', () =
 
   // The control: an invitee who still holds their invite is owed the retry,
   // which is the whole reason this consumer exists.
+  it('skips a queued voice invite after a still-invited attendee declines', async () => {
+    const { db, env } = setup();
+    await seedPendingVoiceInvite(db);
+    await db.prepare("UPDATE event_attendance SET rsvp_status = 'declined' WHERE user_id = 'removed'").run();
+    fetchStub = stubFetch([DM_CHANNEL_RULE, dmSendRule(200), membershipRule(200)]);
+    await runReminderSweep(env);
+    expect((await db.prepare("SELECT delivered_at FROM notification_log WHERE id = 'nl-1'").first<{ delivered_at: number | null }>())?.delivered_at).toBeNull();
+    expect(fetchStub.bodies.some(body => body?.includes('join the'))).toBe(false);
+  });
+
   it('still delivers to someone who is still invited', async () => {
     const { db, env } = setup();
     await seedPendingVoiceInvite(db);

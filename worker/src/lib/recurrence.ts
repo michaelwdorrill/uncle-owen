@@ -107,6 +107,7 @@ export function expandOccurrences(
   windowFromMs: number,
   windowToMs: number,
   overrides: OccurrenceOverride[],
+  firstOnly = false,
 ): ExpandedOccurrence[] {
   const overrideByDate = new Map(overrides.map((o) => [o.occurrence_date, o]));
   const seriesStart = DateTime.fromISO(rule.startDate, { zone });
@@ -142,6 +143,7 @@ export function expandOccurrences(
 
     if (endAt >= windowFromMs && startAt <= windowToMs) {
       results.push({ date: dateKey, startAt, endAt });
+      if (firstOnly && endAt > windowFromMs) return false;
     }
     return true;
   }
