@@ -1736,7 +1736,12 @@ async function createFannedOutEvent(env: Env, budget: TickBudget, optionId: stri
   if (!budget.trySpend(3)) return 'incomplete';
   const childId = newId();
   const now = Date.now();
-  await env.DB.batch([
+  // A fixed threshold must still have enough eligible votes at insert time.
+  const lostQuorum = `p.poll_strategy = 'threshold' AND p.window_block_minutes IS NULL
+    AND p.poll_threshold_count IS NOT NULL AND (SELECT COUNT(*) FROM event_poll_votes v
+      WHERE v.option_id = o.id AND v.vote = 'yes' AND (v.user_id = p.organizer_id OR EXISTS (
+        SELECT 1 FROM event_invites i WHERE i.event_id = p.id AND i.user_id = v.user_id))) < p.poll_threshold_count`;
+  const [insert] = await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO events (id, guild_id, organizer_id, title, event_type, timezone, start_at, end_at,
          status, poll_mode, poll_resolution_mode, is_recurring, voice_channel_id, voice_channel_name,
@@ -1748,7 +1753,7 @@ async function createFannedOutEvent(env: Env, budget: TickBudget, optionId: stri
          (p.window_block_minutes IS NULL AND p.poll_threshold_count IS NOT NULL), ?, ?
        FROM event_poll_options o JOIN events p ON p.id = o.event_id
        WHERE o.id = ? AND o.confirmed_at IS NOT NULL AND p.status != 'cancelled'
-         AND p.poll_resolution_mode = 'multi_winner'
+         AND p.poll_resolution_mode = 'multi_winner' AND (${lostQuorum}) IS NOT TRUE
          AND NOT EXISTS (SELECT 1 FROM events child WHERE child.created_from_option_id = o.id)`,
     ).bind(childId, now, now, optionId),
     // An invite's parent key is already unique. Prefix it with the new event's
@@ -1769,6 +1774,15 @@ async function createFannedOutEvent(env: Env, budget: TickBudget, optionId: stri
            AND a.avail_start_at <= c.start_at AND a.avail_end_at >= c.end_at)))`,
     ).bind(now, childId),
   ]);
+  if (!insert.meta.changes) {
+    // Recheck before clearing, since another vote may have restored quorum.
+    if (!budget.trySpend(1)) return 'incomplete';
+    await env.DB.prepare(
+      `UPDATE event_poll_options AS o SET confirmed_at = NULL WHERE o.id = ? AND o.confirmed_at IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM events child WHERE child.created_from_option_id = o.id)
+       AND EXISTS (SELECT 1 FROM events p WHERE p.id = o.event_id AND ${lostQuorum})`,
+    ).bind(optionId).run();
+  }
 }
 
 // Multi-winner polls confirm individual days as soon as they hit quorum
@@ -1905,10 +1919,24 @@ async function sweepCancellationCascade(
        FROM events
        WHERE status = 'cancelled' AND is_recurring = 0
          AND updated_at >= ?
+         AND (invite_edit_due = 1 OR event_type = 'poll' OR EXISTS (
+           SELECT 1 FROM users u JOIN user_guild_membership m ON m.user_id = u.id AND m.guild_id = events.guild_id
+             AND m.is_member = 1 AND m.verified_at >= ?
+           JOIN guilds g ON g.id = m.guild_id AND g.is_active = 1
+           LEFT JOIN notification_log nl ON nl.event_id = events.id AND nl.user_id = u.id AND nl.occurrence_date = ''
+             AND nl.notification_type = CASE WHEN events.cancelled_by_organizer = 0 AND events.minimum_attendees IS NOT NULL
+               THEN 'event_cancelled_below_minimum' ELSE 'event_cancelled' END
+           WHERE ${PENDING_NOTIFICATION_WHERE}
+             AND ((events.cancelled_by_organizer = 0 AND u.id = events.organizer_id AND NOT EXISTS (
+               SELECT 1 FROM event_attendance a WHERE a.event_id = events.id AND a.user_id = u.id
+                 AND a.occurrence_date = '' AND a.rsvp_status = 'declined'))
+               OR (u.id != events.organizer_id AND EXISTS (SELECT 1 FROM event_attendance a JOIN event_invites i
+                 ON i.event_id = a.event_id AND i.user_id = a.user_id WHERE a.event_id = events.id AND a.user_id = u.id
+                   AND a.occurrence_date = '' AND a.rsvp_status = 'accepted')))))
        LIMIT ?
      )`,
   )
-    .bind(GLOBAL_SCAN_LIMIT, terminalHistoryHotCutoff(), GLOBAL_SCAN_LIMIT)
+    .bind(GLOBAL_SCAN_LIMIT, terminalHistoryHotCutoff(), membershipCutoff(), ...pendingNotificationWhereBinds(), GLOBAL_SCAN_LIMIT)
     .all<EventRow & { kind: 'prompt' | 'notice'; minimum_attendees: number | null; invite_edit_due: number }>();
 
   for (const row of results) {
@@ -3723,28 +3751,43 @@ export async function runReminderSweep(env: Env): Promise<void> {
   await runIsolated('launchAnnouncement', () => sweepLaunchAnnouncement(env, budget, cursors));
   await runIsolated('pollDeadlines', () => sweepPollDeadlines(env, budget));
   await runIsolated('changeRequestDeadlines', () => sweepChangeRequestDeadlines(env, budget));
-  await runIsolated('singleWinnerPollNotifications', () => sweepSingleWinnerPollNotifications(env, budget, cursors));
-  await runIsolated('multiWinnerPollClosedNotifications', () =>
-    sweepMultiWinnerPollClosedNotifications(env, budget, cursors),
-  );
-  await runIsolated('confirmedMultiWinnerOptions', () => sweepConfirmedMultiWinnerOptions(env, budget, cursors));
-  // Filled by the cancellation sweep, drained after new invites -- see
-  // sweepCancelledInviteEdits.
   const cancelledInviteEditsDue: CancelledEvent[] = [];
-  await runIsolated('cancellationCascade', () => budget.withHalfBudget(() => sweepCancellationCascade(env, budget, cancelledInviteEditsDue)));
-  await runIsolated('minimumAttendeesDeadlines', () => sweepMinimumAttendeesDeadlines(env, budget, cursors));
-  await runIsolated('minimumAttendeesDeadlineWarnings', () =>
-    sweepMinimumAttendeesDeadlineWarnings(env, budget, cursors),
-  );
-  await runIsolated('newInvites', () => sweepNewInvites(env, budget));
+  const deliveries: Record<string, () => Promise<void>> = {
+    newInvites: () => sweepNewInvites(env, budget),
+    changeRequestNotifications: () => sweepChangeRequestNotifications(env, budget),
+    reminders: () => sweepReminders(env, budget, cursors),
+    pollDeadlineReminders: () => sweepPollDeadlineReminders(env, budget, cursors),
+    voiceChannelInvites: () => sweepVoiceChannelInvites(env, budget, cursors),
+    idleGroups: () => sweepIdleGroups(env, budget, cursors),
+    groupDrift: () => sweepGroupDrift(env, budget),
+    organizerRsvpNotices: () => sweepOrganizerRsvpNotices(env, budget),
+    dueNotificationRetries: () => sweepDueNotificationRetries(env, budget, cursors),
+    dueNudgeRetries: () => sweepDueNudgeRetries(env, budget, cursors),
+  };
+  const order = Object.keys(deliveries);
+  const focus = cursors.get('notification_turn');
+  const deferred: string[] = [];
+  const runDelivery = async (name: string) => {
+    if (name === focus) return;
+    if (budget.exhausted) deferred.push(name);
+    await runIsolated(name, deliveries[name]);
+  };
+
+  const settleEvents = async () => {
+    await runIsolated('singleWinnerPollNotifications', () => sweepSingleWinnerPollNotifications(env, budget, cursors));
+    await runIsolated('multiWinnerPollClosedNotifications', () => sweepMultiWinnerPollClosedNotifications(env, budget, cursors));
+    await runIsolated('confirmedMultiWinnerOptions', () => sweepConfirmedMultiWinnerOptions(env, budget, cursors));
+    await runIsolated('cancellationCascade', () => budget.withHalfBudget(() => sweepCancellationCascade(env, budget, cancelledInviteEditsDue)));
+    await runIsolated('minimumAttendeesDeadlines', () => sweepMinimumAttendeesDeadlines(env, budget, cursors));
+    await runIsolated('minimumAttendeesDeadlineWarnings', () => sweepMinimumAttendeesDeadlineWarnings(env, budget, cursors));
+  };
+  if (focus && deliveries[focus]) {
+    await budget.withHalfBudget(() => runIsolated(focus, deliveries[focus]));
+  }
+  await settleEvents();
+  await runDelivery('newInvites');
   await runIsolated('cancelledInviteEdits', () => sweepCancelledInviteEdits(env, budget, cancelledInviteEditsDue));
-  await runIsolated('changeRequestNotifications', () => sweepChangeRequestNotifications(env, budget));
-  await runIsolated('reminders', () => sweepReminders(env, budget, cursors));
-  await runIsolated('pollDeadlineReminders', () => sweepPollDeadlineReminders(env, budget, cursors));
-  await runIsolated('voiceChannelInvites', () => sweepVoiceChannelInvites(env, budget, cursors));
-  await runIsolated('idleGroups', () => sweepIdleGroups(env, budget, cursors));
-  await runIsolated('groupDrift', () => sweepGroupDrift(env, budget));
-  await runIsolated('organizerRsvpNotices', () => sweepOrganizerRsvpNotices(env, budget));
+  for (const name of order.slice(1, -2)) await runDelivery(name);
   await runIsolated('pruneStaleSessions', () => pruneStaleSessions(env));
   await runIsolated('pruneOAuthCallbackCounts', () => pruneOAuthCallbackCounts(env));
   await runIsolated('purgeTerminalHistory', () => sweepPurgeTerminalHistory(env, budget));
@@ -3754,8 +3797,8 @@ export async function runReminderSweep(env: Env): Promise<void> {
   // next_attempt_at. Run before reaping so a row that just became due gets a
   // chance at delivery in the same tick it's picked up in, rather than
   // possibly being reaped on a tick it was never actually retried.
-  await runIsolated('dueNotificationRetries', () => sweepDueNotificationRetries(env, budget, cursors));
-  await runIsolated('dueNudgeRetries', () => sweepDueNudgeRetries(env, budget, cursors));
+  await runDelivery('dueNotificationRetries');
+  await runDelivery('dueNudgeRetries');
   // Last of the budget-charged sweeps, deliberately: its own threshold is a
   // year of inactivity, so it has nothing to lose by going last and being the
   // one starved on a busy tick, and everything above it (same-day reminders,
@@ -3770,6 +3813,9 @@ export async function runReminderSweep(env: Env): Promise<void> {
   // Persisted once, after every sweep has had its turn. Isolated like the
   // sweeps themselves: losing the cursor write costs a tick of re-scanning,
   // which the outbox dedupes, and must not mask a tick that otherwise worked.
+  const nextFocus = budget.exhausted || deferred.length ? order[(order.indexOf(focus ?? '') + 1) % order.length] : null;
+  if (nextFocus || focus) cursors.set('notification_turn', nextFocus);
+  console.log('Reminder budget', JSON.stringify({ remaining: budget.remaining(), deferred, nextFocus }));
   await runIsolated('flushCursors', () => cursors.flush());
 
   // Routinely hitting zero means work is being deferred every tick, which is

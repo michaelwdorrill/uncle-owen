@@ -335,6 +335,8 @@ async function loadConfirmedYesVotesForEvents(
        SELECT o.event_id, r.user_id, o.start_at, o.end_at
        FROM event_poll_options o JOIN events p ON p.id = o.event_id CROSS JOIN requested r
        WHERE o.event_id IN (${placeholders(chunk.length)}) AND o.confirmed_at IS NOT NULL
+         AND (p.organizer_id = r.user_id OR EXISTS (SELECT 1 FROM event_invites i
+               WHERE i.event_id = p.id AND i.user_id = r.user_id))
          AND o.start_at <= ? AND o.end_at >= ?
          AND NOT EXISTS (SELECT 1 FROM events c WHERE c.created_from_option_id = o.id)
          AND ((p.window_block_minutes IS NULL AND EXISTS (

@@ -1,3 +1,5 @@
+import { signJwt } from '../src/lib/jwt';
+import { createSession } from '../src/lib/sessions';
 import { generateKeyPairSync, sign, type KeyObject } from 'node:crypto';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { buildApp } from '../src/router';
@@ -334,6 +336,22 @@ describe('a plain organizer cancel (no minimum set)', () => {
     }
   }
 
+  it('records an organizer cancellation even with a minimum and only notifies other attendees', async () => {
+    const { db, env } = setup();
+    await seedPlainEvent(db, 'e1');
+    await db.prepare("UPDATE events SET minimum_attendees = 2 WHERE id = 'e1'").run();
+    const { id } = await createSession(env, 'organizer');
+    const headers = { Authorization: 'Bearer ' + await signJwt('organizer', id, env.JWT_SIGNING_KEY) };
+    fetchStub = stubFetch([DM_CHANNEL_RULE, dmSendRule(200), membershipRule(200)]);
+    expect((await app.request('https://worker.test/events/e1', { method: 'DELETE', headers }, env)).status).toBe(200);
+    await runReminderSweep(env);
+    const notices = await db.prepare("SELECT user_id, content FROM notification_log WHERE event_id = 'e1' AND notification_type = 'event_cancelled' ORDER BY user_id")
+      .all<{ user_id: string; content: string }>();
+    expect(notices.results.map(row => row.user_id)).toEqual(['alice', 'bob']);
+    expect(notices.results[0].content).toContain('by the organizer');
+    expect(await countRows(db, 'notification_log', "notification_type = 'event_cancelled_below_minimum'")).toBe(0);
+  });
+
   it('notifies everyone still confirmed, with wording that names no minimum, once', async () => {
     const { db, env } = setup();
     await seedPlainEvent(db, 'e1');
@@ -530,11 +548,15 @@ describe('decision 3: attendance survives a schedule edit unless the local date 
     expect(await countRows(db, 'event_attendance', `event_id = 'e1' AND user_id = 'alice'`)).toBe(1);
   });
 
-  it.each([['2026-09-10', 1], ['2026-09-11', 0]] as const)('converts a one-off to a series starting %s', async (first, retained) => {
+  it.each([
+    ['2026-09-10', null, 1],
+    ['2026-09-11', null, 0],
+    ['2026-09-10', 0, 0], // series starts on Thursday but meets on Mondays
+  ] as const)('converts a one-off to a series starting %s with weekday %s', async (first, weekday, retained) => {
     const { db, env } = setup();
     await seedAnsweredEvent(db, Date.parse('2026-09-11T01:00:00Z'), 'America/New_York');
     await updateEvent(env, 'e1', 'guild-1', {
-      isRecurring: true, recurrence: { freq: 'DAILY', interval: 1, byWeekday: null, byMonthDay: null,
+      isRecurring: true, recurrence: { freq: weekday == null ? 'DAILY' : 'WEEKLY', interval: 1, byWeekday: weekday == null ? null : [weekday], byMonthDay: null,
         startDate: first, startTime: '21:00', durationMinutes: 60, endType: 'never', endDate: null, endCount: null },
     }, await loadEventRow(db, 'e1'));
     expect(await countRows(db, 'event_attendance', "event_id = 'e1' AND user_id = 'alice' AND occurrence_date = ?", first)).toBe(retained);

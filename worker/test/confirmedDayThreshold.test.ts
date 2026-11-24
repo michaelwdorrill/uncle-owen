@@ -1,3 +1,5 @@
+import { computeBusyBlocksForUsers } from '../src/lib/freeBusy';
+import { getOptionTallies, getWindowedCandidates } from '../src/lib/polls';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createEventWithInvites } from '../src/lib/eventWrites';
 import { runReminderSweep } from '../src/cron/reminders';
@@ -144,6 +146,43 @@ describe('a confirmed multi-winner day that drops below its threshold (IDEAS 97)
     expect(await isConfirmed(db, optionId)).toBe(false);
     await runReminderSweep(env);
     expect(await db.prepare('SELECT id FROM events WHERE created_from_option_id = ?').bind(optionId).first()).toBeNull();
+  });
+
+  it('requires the current editor revision and validates partial poll settings against stored options', async () => {
+    const { db, env } = setup();
+    const { pollId, optionId } = await seedPoll(db, env, { threshold: 2, invitees: ['invitee'], windowed: true });
+    const headers = { Authorization: 'Bearer ' + await authed(env, 'organizer'), 'Content-Type': 'application/json' };
+    const patch = (body: Record<string, unknown>) => buildApp().request('https://worker.test/events/' + pollId, {
+      headers, method: 'PATCH', body: JSON.stringify(body),
+    }, env);
+    const full = { eventType: 'poll', title: 'Retitled poll', invites: { userIds: ['invitee'], groupIds: [] } };
+    expect((await patch(full)).status).toBe(428);
+    expect((await patch({ ...full, revision: 0 })).status).toBe(200);
+    expect((await patch({ ...full, revision: 0 })).status).toBe(409);
+    expect((await patch({ pollThresholdCount: null })).status).toBe(400);
+    expect((await patch({ windowBlockMinutes: 300 })).status).toBe(400);
+    expect((await patch({ windowBlockMinutes: 90 })).status).toBe(200);
+    expect(await db.prepare('SELECT poll_threshold_count, window_block_minutes FROM events WHERE id = ?')
+      .bind(pollId).first()).toMatchObject({ poll_threshold_count: 2, window_block_minutes: 90 });
+    expect(await db.prepare('SELECT id FROM event_poll_options WHERE id = ?').bind(optionId).first()).not.toBeNull();
+  });
+
+  it('skips an option withdrawn after discovery but before the child insert', async () => {
+    const { db, env } = setup();
+    const { pollId, optionId } = await seedPoll(db, env, { threshold: 1, invitees: ['invitee'] });
+    await vote(env, pollId, optionId, 'invitee', 'yes');
+    const realBatch = env.DB.batch.bind(env.DB);
+    let withdrew = false;
+    env.DB.batch = async statements => {
+      if (!withdrew && statements.some(stmt => String((stmt as unknown as { sql?: string }).sql).includes('FROM event_poll_options o JOIN events p'))) {
+        withdrew = true;
+        await db.prepare('UPDATE event_poll_options SET confirmed_at = NULL WHERE id = ?').bind(optionId).run();
+      }
+      return realBatch(statements);
+    };
+    await sweep(env);
+    expect(withdrew).toBe(true);
+    expect(await session(db, optionId)).toBeNull();
   });
 
   it('gives the day its threshold as a minimum, and counts the people who said yes', async () => {
@@ -294,6 +333,47 @@ describe('a confirmed multi-winner day that drops below its threshold (IDEAS 97)
     expect(row.sessionStatus).toBe('active');
     expect(row.myVote).toBe('no');
     expect(row.confirmedUsers.map((u) => u.userId)).toEqual(['organizer']);
+  });
+
+  it('hands a covered window from its poll to the child calendar entry', async () => {
+    const { db, env } = setup();
+    const { pollId, optionId } = await seedPoll(db, env, { threshold: 1, invitees: ['invitee'], windowed: true });
+    const slot = await db.prepare('SELECT start_at, end_at FROM event_poll_options WHERE id = ?')
+      .bind(optionId).first<{ start_at: number; end_at: number }>();
+    const { start_at, end_at } = slot!;
+    await db.prepare(`INSERT INTO event_window_availability
+      (event_id,option_id,user_id,avail_start_at,avail_end_at,submitted_at) VALUES (?,?,'invitee',?,?,?)`)
+      .bind(pollId, optionId, start_at, end_at, Date.now()).run();
+    await db.prepare('UPDATE event_poll_options SET confirmed_at = ? WHERE id = ?').bind(Date.now(), optionId).run();
+    const blocks = async () => (await computeBusyBlocksForUsers(env, ['invitee'], start_at, end_at)).get('invitee');
+    expect(await blocks()).toEqual([{ startAt: start_at, endAt: end_at }]);
+    await sweep(env);
+    const child = await session(db, optionId);
+    expect(await db.prepare("SELECT rsvp_status FROM event_attendance WHERE event_id = ? AND user_id = 'invitee'")
+      .bind(child!.id).first()).toMatchObject({ rsvp_status: 'accepted' });
+    expect(await blocks()).toEqual([{ startAt: start_at, endAt: end_at }]);
+    await db.prepare("UPDATE event_attendance SET rsvp_status = 'declined' WHERE event_id = ? AND user_id = 'invitee'")
+      .bind(child!.id).run();
+    expect(await blocks()).toEqual([]);
+  });
+
+  it.each([true, false])('only counts current invitees and restores retained answers on re-invite, windowed=%s', async windowed => {
+    const { db, env } = setup();
+    const { pollId, optionId } = await seedPoll(db, env, { threshold: 2, invitees: ['invitee'], windowed });
+    if (windowed) {
+      await db.prepare(`INSERT INTO event_window_availability (event_id, option_id, user_id, avail_start_at, avail_end_at, submitted_at)
+        SELECT event_id,id,'invitee',start_at,end_at,? FROM event_poll_options WHERE id = ?`).bind(Date.now(), optionId).run();
+    } else {
+      await vote(env, pollId, optionId, 'invitee', 'yes');
+    }
+    const tally = async () => windowed ? (await getWindowedCandidates(env, pollId))[0].submissions.length
+      : (await getOptionTallies(env, pollId))[0].yes;
+    expect(await tally()).toBe(1);
+    await db.prepare("DELETE FROM event_invites WHERE event_id = ? AND user_id = 'invitee'").bind(pollId).run();
+    expect(await tally()).toBe(0);
+    await db.prepare("INSERT INTO event_invites (id,event_id,user_id,invited_via,rsvp_status,invited_at) VALUES ('back',?,'invitee','individual','pending',?)")
+      .bind(pollId, Date.now()).run();
+    expect(await tally()).toBe(1);
   });
 
   it('leaves a windowed day as it was: no inherited minimum', async () => {

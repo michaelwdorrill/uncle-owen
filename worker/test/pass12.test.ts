@@ -90,6 +90,10 @@ async function seedFannedOutPoll(
     .prepare(`SELECT id FROM event_poll_options WHERE event_id = ? AND start_at = ?`)
     .bind(pollId, slotA.startAt)
     .first<{ id: string }>();
+  for (const voter of ['organizer', 'invitee']) {
+    await db.prepare(`INSERT INTO event_poll_votes (option_id, user_id, vote, voted_at) VALUES (?, ?, 'yes', ?)`)
+      .bind(optA!.id, voter, base).run();
+  }
   await db.prepare(`UPDATE event_poll_options SET confirmed_at = ? WHERE id = ?`).bind(base, optA!.id).run();
 
   fetchStub = stubFetch([DM_CHANNEL_RULE, dmSendRule(200)]);
